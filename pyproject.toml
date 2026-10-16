@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vam-backstage"
+version = "0.1.0"
+description = "Manage a Virt-a-Mate .var library: dependencies, content visibility, Hub installs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PyGObject>=3.46"]
+test = ["pytest>=7", "black>=25", "ruff>=0.12"]
+
+[project.scripts]
+vam-backstage = "vambackstage.main:main"
+
+[tool.setuptools.packages.find]
+include = ["vambackstage*"]
+
+[tool.setuptools.package-data]
+vambackstage = [
+  "ui/style.css",
+  "data/*.desktop",
+  "data/icons/hicolor/512x512/apps/*.png",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["build", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vambackstage"]

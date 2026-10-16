@@ -1,0 +1,75 @@
+/* VaM Backstage — libadwaita theme additions */
+
+.vb-card {
+  border-radius: 10px;
+  background-color: alpha(currentColor, 0.04);
+  border: 1px solid alpha(currentColor, 0.08);
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.vb-card:hover { background-color: alpha(currentColor, 0.08); border-color: alpha(currentColor, 0.16); }
+gridview > child:selected .vb-card { border-color: @accent_bg_color; background-color: alpha(@accent_bg_color, 0.14); }
+gridview > child { padding: 4px; }
+gridview > child:selected { background: none; }
+gridview > child:hover { background: none; }
+
+.vb-thumb {
+  border-radius: 8px 8px 0 0;
+  background: linear-gradient(135deg, #2d3148, #1b1d2a);
+}
+.vb-thumb-placeholder { color: alpha(currentColor, 0.35); }
+.vb-content-thumb { border-radius: 8px; background: linear-gradient(135deg, #2d3148, #1b1d2a); }
+
+.vb-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background-color: alpha(#ffffff, 0.14);
+  color: #ffffff;
+}
+.vb-chip.scenes { background-color: alpha(#3b82f6, 0.85); }
+.vb-chip.looks { background-color: alpha(#ec4899, 0.85); }
+.vb-chip.clothing { background-color: alpha(#8b5cf6, 0.85); }
+.vb-chip.hairstyles { background-color: alpha(#f59e0b, 0.85); color: #1a1200; }
+.vb-chip.poses { background-color: alpha(#f97316, 0.85); color: #1a0d00; }
+.vb-chip.subscenes { background-color: alpha(#06b6d4, 0.85); color: #00161a; }
+.vb-chip.other { background-color: alpha(#6b7280, 0.85); }
+.vb-chip.dep { background-color: alpha(#475569, 0.9); }
+.vb-chip.warn { background-color: alpha(#fbbf24, 0.9); color: #1a1200; }
+.vb-chip.error { background-color: alpha(#f87171, 0.9); color: #2a0000; }
+.vb-chip.muted { background-color: alpha(currentColor, 0.12); color: inherit; }
+.vb-chip.success { background-color: alpha(#34d399, 0.85); color: #00251a; }
+
+.vb-card-title { font-weight: 600; font-size: 13px; }
+.vb-card-sub { font-size: 11px; opacity: 0.65; }
+.vb-card-body { padding: 8px 10px 10px 10px; }
+.vb-card.disabled .vb-thumb, .vb-card.disabled .vb-card-title { opacity: 0.5; }
+
+.vb-filter-panel { background-color: alpha(currentColor, 0.025); }
+.vb-section-label { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; opacity: 0.55; margin-top: 10px; }
+.vb-filter-row { padding: 2px 4px; border-radius: 6px; }
+.vb-filter-row label.count { opacity: 0.5; font-size: 11px; }
+.vb-filter-row:checked { background-color: alpha(@accent_bg_color, 0.18); }
+
+.vb-detail { background-color: alpha(currentColor, 0.025); }
+.vb-detail-title { font-weight: 700; font-size: 16px; }
+.vb-detail-sub { opacity: 0.65; }
+.vb-dep-row { padding: 3px 0; }
+.vb-dep-row.missing { color: #f87171; }
+.vb-dep-row.fallback { color: #fbbf24; }
+.vb-dep-row.inactive { opacity: 0.6; }
+.vb-mono { font-family: monospace; font-size: 11px; }
+
+.vb-statusbar { padding: 3px 12px; font-size: 11px; opacity: 0.8; border-top: 1px solid alpha(currentColor, 0.1); }
+.vb-statusbar progressbar { min-width: 140px; }
+
+.vb-download-row { padding: 8px 10px; }
+.vb-download-row progressbar trough { min-height: 6px; }
+
+.vb-hub-card .vb-card-title { font-size: 13px; }
+.vb-dim { opacity: 0.6; }
+.vb-small { font-size: 11px; }
+
+.vb-json-text { padding: 4px 6px; }
+columnview.data-table > listview > row > cell { padding-top: 2px; padding-bottom: 2px; }
