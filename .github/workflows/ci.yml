@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Engine tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - name: actions/checkout@v6
+        uses: actions/checkout@v6
+      - name: actions/setup-python@v6
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+      - run: python -m ruff check .
+      - run: python -m black --check .
+
+  gtk-smoke:
+    name: GTK smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: actions/checkout@v6
+        uses: actions/checkout@v6
+      - name: Install GTK 4, libadwaita and PyGObject
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-webkit-6.0 libadwaita-1-0 librsvg2-common xvfb python3-pytest adwaita-icon-theme fonts-dejavu-core
+      - run: python3 -m pytest -q
+      - run: python3 scripts/make_demo_library.py demo-vam --packages 50
+      - run: python3 -m vambackstage --data-dir ci-data --vam-dir "$PWD/demo-vam" --scan
+      - name: Open the window headlessly and take a screenshot
+        env:
+          GSK_RENDERER: cairo
+          GDK_BACKEND: x11
+        run: |
+          set -o pipefail
+          xvfb-run -a -s "-screen 0 1400x900x24" python3 -m vambackstage --data-dir ci-data --vam-dir "$PWD/demo-vam" --quit-after 8 --screenshot screenshot-${{ matrix.os }}.png
+          xvfb-run -a -s "-screen 0 1400x900x24" python3 -m vambackstage --data-dir ci-data --vam-dir "$PWD/demo-vam" --debug-fake-hub --debug-view hub --debug-select 3 --quit-after 9 --screenshot screenshot-hub-${{ matrix.os }}.png
+          xvfb-run -a -s "-screen 0 1400x900x24" python3 -m vambackstage --data-dir ci-data --vam-dir "$PWD/demo-vam" --debug-fake-hub --debug-view hub --debug-action debug_hub_page --quit-after 12 --screenshot screenshot-webkit-${{ matrix.os }}.png 2>&1 | tee webkit-smoke.log
+          ! grep -E "WebKitGTK is not|Hub page stopped|Traceback" webkit-smoke.log
+      - name: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshot-${{ matrix.os }}
+          path: screenshot-*.png
+          if-no-files-found: error

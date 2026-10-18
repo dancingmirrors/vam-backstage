@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=VaM Backstage
+GenericName=Package manager for Virt-a-Mate
+Comment=Manage your Virt-a-Mate .var library: dependencies, content visibility, Hub installs
+Exec=vam-backstage
+Icon=org.dancingmirrors.VamBackstage
+Terminal=false
+Categories=Game;Utility;
+Keywords=VaM;Virt-a-Mate;var;packages;Hub;
+StartupNotify=true
+StartupWMClass=org.dancingmirrors.VamBackstage
