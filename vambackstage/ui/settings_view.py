@@ -416,6 +416,9 @@ class SettingsDialog(Adw.PreferencesDialog):
         self.placeholder_row = self._action_row("Stand-in packages", "Counting…", "Show", self._show_placeholders)
         group.add(self.placeholder_row)
         run_async(self.lib.placeholder_counts, on_done=self._placeholder_counts_done)
+        self.bookmark_row = self._action_row("Bookmarks", "Counting…", "Show", self._show_bookmarks)
+        group.add(self.bookmark_row)
+        run_async(self.lib.db.count_bookmarks, on_done=self._bookmark_count_done)
         n_ignored = len(self.backend.ignored_updates())
         self.ignored_row = self._action_row(
             "Ignored updates",
@@ -453,6 +456,17 @@ class SettingsDialog(Adw.PreferencesDialog):
             f"{c['dummies']} dummy package(s) and {c['aliases']} alias(es) stand in for packages you do not have. "
             "Listed in the library under Dummy packages and Aliases, in case you find the real ones later."
         )
+
+    def _bookmark_count_done(self, n: int) -> None:
+        self.bookmark_row.set_subtitle(
+            f"{n} Hub resource(s) noted for later from Hub pages, with the creator's link and a note of your own. "
+            "Listed in the library under Bookmarked; each clears itself once a package of it is in your library."
+        )
+
+    def _show_bookmarks(self):
+        self.close()
+        self.window.stack.set_visible_child_name("library")
+        self.window.library.show_status("bookmarked")
 
     def _forget_ignored(self):
         n = self.backend.clear_ignored_updates()

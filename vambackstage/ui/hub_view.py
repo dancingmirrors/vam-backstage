@@ -35,6 +35,8 @@ class HubCard(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.loader = loader
         self.rid: str | None = None
+        self.installed: dict | None = None
+        self.bookmarked = False
         self.add_css_class("vb-card")
         self.add_css_class("vb-hub-card")
         self.set_size_request(190, -1)
@@ -62,7 +64,7 @@ class HubCard(Gtk.Box):
         body.append(self.meta)
         self.append(body)
 
-    def bind(self, r: dict, installed: dict | None):
+    def bind(self, r: dict, installed: dict | None, bookmarked: bool = False):
         self.title.set_text(r.get("title") or "")
         self.sub.set_text(f"{r.get('username') or '?'} · v{r.get('version_string') or '?'}")
         self.meta.set_text(f"{_i(r.get('download_count'))} downloads · {r.get('category') or ''}")
@@ -71,12 +73,23 @@ class HubCard(Gtk.Box):
         self.badges.append(chip(t.upper(), HUB_TYPE_CLASS.get(t, "other")))
         if r.get("category") and r["category"] != "Free":
             self.badges.append(chip(r["category"].upper(), "warn"))
-        self.set_installed(installed)
+        self.installed = installed
+        self.bookmarked = bookmarked
+        self._render_state()
         rid = r.get("resource_id")
         self.thumb.load(self.loader, f"hub-icon:{rid}" if rid else None)
 
     def set_installed(self, installed: dict | None) -> None:
+        self.installed = installed
+        self._render_state()
+
+    def set_bookmarked(self, bookmarked: bool) -> None:
+        self.bookmarked = bookmarked
+        self._render_state()
+
+    def _render_state(self) -> None:
         clear_box(self.state)
+        installed = self.installed
         if installed:
             self.state.append(
                 chip(
@@ -84,6 +97,8 @@ class HubCard(Gtk.Box):
                     "success" if installed.get("is_direct") else "dep",
                 )
             )
+        if self.bookmarked:
+            self.state.append(chip("BOOKMARKED", "bookmark"))
 
 
 class HubView(Gtk.Box):
@@ -227,10 +242,13 @@ class HubView(Gtk.Box):
         self.queued_rids: set[str] = set()
         self._queued_debounce = Debouncer(150, self._refresh_queued)
         window.bridge.connect("downloads:updated", lambda _p: self._queued_debounce.trigger())
+        self.bookmarked: set[str] = set()
+        self._bookmarked_debounce = Debouncer(150, self._refresh_bookmarked)
+        window.bridge.connect("bookmarks:updated", lambda _p: self._bookmarked_debounce.trigger())
 
     def _bind_card(self, _factory, item) -> None:
         card, rid = item.get_child(), item.get_item().key
-        card.bind(item.get_item().data, self.installed.get(rid))
+        card.bind(item.get_item().data, self.installed.get(rid), rid in self.bookmarked)
         card.rid = rid
         self._cards[rid] = card
 
@@ -243,7 +261,17 @@ class HubView(Gtk.Box):
         if not self._started:
             self._started = True
             self._refresh_queued()
+            self._refresh_bookmarked()
             self._load_filters()
+
+    def _refresh_bookmarked(self):
+        def done(rids):
+            self.bookmarked = rids
+            for rid, card in self._cards.items():
+                card.set_bookmarked(rid in rids)
+            self.detail.refresh_state()
+
+        run_async(self.backend.lib.bookmarked_resource_ids, on_done=done)
 
     def _refresh_queued(self):
 
@@ -460,6 +488,9 @@ class HubDetail(Gtk.Box):
             lambda *_: open_url(hub_resource_page_url(self.resource["resource_id"])) if self.resource else None,
         )
         actions.append(self.open_btn)
+        self.bookmark_btn = Gtk.Button(label="Bookmark")
+        self.bookmark_btn.connect("clicked", lambda *_: self.toggle_bookmark())
+        actions.append(self.bookmark_btn)
         self.append(actions)
         self.stats = label("", "vb-dim vb-small", wrap=True)
         self.append(self.stats)
@@ -607,6 +638,35 @@ class HubDetail(Gtk.Box):
         else:
             self.install_btn.set_label("Install")
             self.install_btn.set_sensitive(True)
+        if rid in self.view.bookmarked:
+            self.bookmark_btn.set_label("Remove bookmark")
+            self.bookmark_btn.set_tooltip_text("Listed in your library under Bookmarked; forget it.")
+        else:
+            self.bookmark_btn.set_label("Bookmark")
+            self.bookmark_btn.set_tooltip_text(
+                "Note it for later: it is listed in your library under Bookmarked, with the creator's link and a "
+                "note of your own, until a package of it arrives. Handy for paid or externally hosted resources."
+            )
+
+    def toggle_bookmark(self):
+        r = self.resource
+        if not r or not r.get("resource_id"):
+            return
+        rid = str(r["resource_id"])
+        if rid in self.view.bookmarked:
+            self.view.window.run_op(self.backend.lib.remove_bookmark, rid, success="Bookmark removed")
+            return
+        self.bookmark_btn.set_sensitive(False)
+
+        def done(res):
+            self.bookmark_btn.set_sensitive(True)
+            self.view.window.toast(f"Bookmarked {res['title']}: listed in the library under Bookmarked")
+
+        def failed(err):
+            self.bookmark_btn.set_sensitive(True)
+            self.view.window.toast(f"Could not bookmark it: {err}", 8)
+
+        run_async(self.backend.bookmark_resource, rid, self.detail or r, on_done=done, on_error=failed)
 
     def install(self):
         r = self.resource

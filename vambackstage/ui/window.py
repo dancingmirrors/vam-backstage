@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 
 from gi.repository import Adw, Gio, GLib, Gtk
 
@@ -122,6 +123,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.bridge.connect("contents:updated", lambda _p: self._stats_debounce.trigger())
         self.bridge.connect("scan:progress", self._on_scan_progress)
         self.bridge.connect("toast", self._on_toast)
+        self.bridge.connect("bookmarks:resolved", self._on_bookmarks_resolved)
         self.bridge.connect("downloads:updated", lambda _p: self._update_downloads_badge())
         self.stack.connect("notify::visible-child", lambda *_: self._on_view_changed())
         self._first_run = None
@@ -134,11 +136,14 @@ class MainWindow(Adw.ApplicationWindow):
         action.connect("activate", lambda *_: cb())
         self.add_action(action)
 
-    def toast(self, message: str, timeout: int = 4) -> None:
+    def toast(self, message: str, timeout: int = 4, button: tuple[str, Callable[[], None]] | None = None) -> None:
         previous = getattr(self, "_current_toast", None)
-        if previous is not None:
+        if previous is not None and not previous.get_button_label():
             previous.dismiss()
         toast = Adw.Toast(title=message, timeout=timeout, use_markup=False)
+        if button:
+            toast.set_button_label(button[0])
+            toast.connect("button-clicked", lambda *_: button[1]())
         self._current_toast = toast
         toast.connect(
             "dismissed",
@@ -153,6 +158,21 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_toast(self, payload):
         if isinstance(payload, dict) and payload.get("message"):
             self.toast(payload["message"], 6)
+
+    def _on_bookmarks_resolved(self, payload):
+        items = [b for b in ((payload or {}).get("bookmarks") or []) if isinstance(b, dict)]
+        if not items:
+            return
+        if len(items) == 1:
+            msg = f"Bookmark cleared: {items[0]['title']} is in your library now as {items[0]['installed_filename']}"
+        else:
+            titles = ", ".join(b["title"] for b in items[:3]) + (" …" if len(items) > 3 else "")
+            msg = f"{len(items)} bookmarks cleared, their packages are in your library now: {titles}"
+
+        def restore() -> None:
+            self.run_op(self.backend.lib.restore_bookmarks, items, success="Bookmarks restored")
+
+        self.toast(msg, 10, ("Restore", restore))
 
     def confirm(self, heading: str, body: str, action_label: str, on_ok, destructive: bool = True) -> None:
         dialog = Adw.AlertDialog(heading=heading, body=body)

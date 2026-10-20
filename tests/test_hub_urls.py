@@ -1,4 +1,10 @@
-from vambackstage.hub.client import hub_resource_page_url, is_hub_url, parse_hub_download_url, pick_hub_file
+from vambackstage.hub.client import (
+    hub_resource_page_url,
+    is_hub_url,
+    parse_hub_download_url,
+    parse_hub_resource_url,
+    pick_hub_file,
+)
 
 DL = "https://hub.virtamate.com/resources"
 
@@ -45,6 +51,24 @@ def test_parse_hub_download_url_ignores_other_links():
     assert parse_hub_download_url("https://cdn.example/resources/1/download?file=2") is None
     assert parse_hub_download_url("https://hub.virtamate.com/threads/5/download") is None
     assert parse_hub_download_url(None) is None
+
+
+def test_parse_hub_resource_url_reads_resource_pages_only():
+    assert parse_hub_resource_url(hub_resource_page_url(66186)) == "66186"
+    assert parse_hub_resource_url(f"{DL}/moya-german-gamer-girl.66186/") == "66186"
+    assert parse_hub_resource_url(f"{DL}/some.title.with.dots.123/updates") == "123"
+    assert parse_hub_resource_url(f"{DL}/211/overview-panel?x=1#frag") == "211"
+    assert parse_hub_resource_url(f"{DL}/some-look.1125/version/21060/download?file=82325") == "1125"
+    assert parse_hub_resource_url(f"{DL}/007") == "7"
+    assert parse_hub_resource_url(f"{DL}/authors/someone.456/") is None
+    assert parse_hub_resource_url(f"{DL}/categories/looks.4/") is None
+    assert parse_hub_resource_url(f"{DL}/?q=moya") is None
+    assert parse_hub_resource_url(f"{DL}/") is None
+    assert parse_hub_resource_url(f"{DL}/title.123abc/") is None
+    assert parse_hub_resource_url(f"{DL}/x.\u0663/") is None
+    assert parse_hub_resource_url("https://hub.virtamate.com/threads/5/") is None
+    assert parse_hub_resource_url("https://example.com/resources/1") is None
+    assert parse_hub_resource_url(None) is None and parse_hub_resource_url("") is None
 
 
 def _detail(*files, version="90612"):

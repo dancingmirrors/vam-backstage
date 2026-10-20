@@ -698,6 +698,30 @@ def test_same_package_under_another_creator_name_can_be_aliased(vam):
     lib.close()
 
 
+def test_kept_old_versions_are_not_nagged(vam):
+    lib = make_lib(vam)
+    for v in (1, 2):
+        drop(vam.addon_packages, f"Acid.Tool.{v}.var")
+    lib.scan()
+    pk = by_name(lib)
+    assert pk["Acid.Tool.1.var"]["is_superseded"] and not pk["Acid.Tool.1.var"]["keep_version"]
+    assert lib.status_counts()["superseded"] == 1
+    assert lib.set_keep_version("Acid.Tool.1.var", True) == {"ok": True, "count": 1}
+    pk = by_name(lib)
+    assert pk["Acid.Tool.1.var"]["keep_version"] and not pk["Acid.Tool.1.var"]["is_superseded"]
+    assert lib.status_counts()["superseded"] == 0 and row(lib, "Acid.Tool.1.var")["keep_version"] == 1
+    assert lib.remove_superseded()["count"] == 0 and (vam.addon_packages / "Acid.Tool.1.var").exists()
+    drop(vam.addon_packages, "Acid.Tool.1.var", files={"a.txt": "changed, so the rescan re-reads it"})
+    lib.scan()
+    pk = by_name(lib)
+    assert pk["Acid.Tool.1.var"]["keep_version"] and not pk["Acid.Tool.1.var"]["is_superseded"]
+    lib.set_keep_version(["Acid.Tool.1.var"], False)
+    assert by_name(lib)["Acid.Tool.1.var"]["is_superseded"] and lib.status_counts()["superseded"] == 1
+    with pytest.raises(KeyError):
+        lib.set_keep_version("Nope.1.var", True)
+    lib.close()
+
+
 def test_old_versions_nothing_names_exactly_are_superseded(vam):
     lib = make_lib(vam)
     for v in (1, 2, 3):

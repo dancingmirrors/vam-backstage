@@ -45,6 +45,7 @@ def hub_resource_icon_url(resource_id) -> str | None:
 
 HUB_HOST = "hub.virtamate.com"
 _HUB_DOWNLOAD_PATH = re.compile(r"^/resources/(?:[^/]*\.)?([0-9]+)(?:/version/([0-9]+))?/download/?$", re.ASCII)
+_HUB_RESOURCE_PATH = re.compile(r"^/resources/(?:[^/]*\.)?([0-9]+)(?:/.*)?$", re.ASCII)
 
 
 def hub_resource_page_url(resource_id) -> str:
@@ -86,6 +87,15 @@ def parse_hub_download_url(url) -> tuple[str, str | None, str | None] | None:
     if not m:
         return None
     return _id_text(m.group(1)) or m.group(1), _query_file_id(url), _id_text(m.group(2))
+
+
+def parse_hub_resource_url(url) -> str | None:
+    if not is_hub_url(url):
+        return None
+    m = _HUB_RESOURCE_PATH.match(urllib.parse.urlsplit(str(url)).path)
+    if not m:
+        return None
+    return _id_text(m.group(1)) or m.group(1)
 
 
 def pick_hub_file(detail: dict | None, file_id: str | None, version_id: str | None = None) -> dict | None:

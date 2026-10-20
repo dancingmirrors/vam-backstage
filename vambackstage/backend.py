@@ -10,8 +10,8 @@ from .core.library import Library
 from .core.paths import user_cache_dir
 from .core.store import resolve_hub_download_url
 from .core.watcher import LibraryWatcher
-from .hub.client import HubClient
-from .hub.downloads import DownloadManager
+from .hub.client import HubClient, HubError
+from .hub.downloads import DownloadError, DownloadManager
 from .hub.enrich import enrich_new_packages, retry_pending_hub_details, scan_hub_details
 from .hub.http import HttpTransport, UrllibTransport
 from .hub.packages_json import PackagesJsonIndex
@@ -209,8 +209,41 @@ class Backend:
     def _enrich_new(self, filenames: list[str]) -> None:
         self.refresh_catalog()
         changed = enrich_new_packages(self.lib, self.hub, self.packages_json, filenames)
+        if changed:
+            self.lib.resolve_bookmarks(filenames)
         if self.retry_pending_hub_details()["fetched"] or changed:
             self.thumbs.resolve_package_thumbnails(self.packages_json.index)
+
+    def bookmark_resource(
+        self, resource_id, snapshot: dict | None = None, note: str | None = None, fallback_title: str | None = None
+    ) -> dict:
+        rid = str(resource_id)
+        data = dict(snapshot or {})
+        if "dependencies" not in data:
+            try:
+                data.update(self.hub.get_resource_detail(rid))
+            except HubError as err:
+                if not data and not fallback_title:
+                    raise
+                log.info("bookmarking resource %s from the page alone: %s", rid, err)
+        if fallback_title and not data.get("title"):
+            data["title"] = fallback_title
+        return self.lib.add_bookmark(rid, data, note)
+
+    def install_bookmarks(self, resource_ids) -> dict:
+        queued = already = 0
+        failed: list[tuple[str, str]] = []
+        for rid in resource_ids:
+            try:
+                res = self.downloads.enqueue_install(str(rid))
+            except (DownloadError, HubError) as err:
+                failed.append((str(rid), str(err)))
+                continue
+            if res["inserted"]:
+                queued += res["inserted"]
+            else:
+                already += 1
+        return {"queued": queued, "already": already, "failed": failed}
 
     def retry_pending_hub_details(self) -> dict:
         return retry_pending_hub_details(self.lib, self.hub)

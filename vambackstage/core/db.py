@@ -12,7 +12,7 @@ from typing import Any
 
 from .paths import LOCAL_PACKAGE_DISPLAY_NAME, LOCAL_PACKAGE_FILENAME
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 _INT_RE = re.compile(r"[0-9]+")
 
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS packages (
   is_corrupted          INTEGER NOT NULL DEFAULT 0,
   is_dummy              INTEGER NOT NULL DEFAULT 0,
   is_unpacked           INTEGER NOT NULL DEFAULT 0,
+  keep_version          INTEGER NOT NULL DEFAULT 0,
   dep_refs              TEXT NOT NULL DEFAULT '[]',
   hub_detail_applied_at INTEGER,
   hub_name_checked_at   INTEGER,
@@ -154,6 +155,13 @@ CREATE TABLE IF NOT EXISTS local_refs (
   size_bytes    INTEGER NOT NULL,
   refs          TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS bookmarks (
+  resource_id TEXT PRIMARY KEY,
+  hub_json    TEXT NOT NULL,
+  note        TEXT,
+  created_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
 """
 
 _LOCAL_REFS_TABLE = """CREATE TABLE IF NOT EXISTS local_refs (
@@ -161,6 +169,13 @@ _LOCAL_REFS_TABLE = """CREATE TABLE IF NOT EXISTS local_refs (
   file_mtime    REAL NOT NULL,
   size_bytes    INTEGER NOT NULL,
   refs          TEXT NOT NULL
+)"""
+
+_BOOKMARKS_TABLE = """CREATE TABLE IF NOT EXISTS bookmarks (
+  resource_id TEXT PRIMARY KEY,
+  hub_json    TEXT NOT NULL,
+  note        TEXT,
+  created_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
 )"""
 
 
@@ -179,6 +194,8 @@ MIGRATIONS: list[tuple[int, Any]] = [
     (3, _add_column("packages", "is_dummy", "INTEGER NOT NULL DEFAULT 0")),
     (4, lambda conn: conn.execute(_LOCAL_REFS_TABLE)),
     (5, _add_column("packages", "is_unpacked", "INTEGER NOT NULL DEFAULT 0")),
+    (6, lambda conn: conn.execute(_BOOKMARKS_TABLE)),
+    (7, _add_column("packages", "keep_version", "INTEGER NOT NULL DEFAULT 0")),
 ]
 
 
@@ -364,6 +381,9 @@ class Database:
     def set_package_type_override(self, filename: str, type_override: str | None) -> None:
         v = None if type_override in (None, "") else str(type_override)
         self._run("UPDATE packages SET type_override = ? WHERE filename = ?", (v, filename))
+
+    def set_package_keep_version(self, filename: str, keep: bool) -> None:
+        self._run("UPDATE packages SET keep_version = ? WHERE filename = ?", (1 if keep else 0, filename))
 
     def set_package_type_from_hub(self, filename: str, hub_type: str | None) -> None:
         t = (hub_type or "").strip()
@@ -922,3 +942,50 @@ class Database:
         return self._run(
             "DELETE FROM labels WHERE id NOT IN (SELECT label_id FROM label_packages) AND id NOT IN (SELECT label_id FROM label_contents)"
         ).rowcount
+
+    _BOOKMARK_COLUMNS = "resource_id, hub_json, note, created_at"
+
+    def list_bookmarks(self) -> list[dict]:
+        return self._all(f"SELECT {self._BOOKMARK_COLUMNS} FROM bookmarks ORDER BY created_at DESC, resource_id DESC")
+
+    def get_bookmark(self, resource_id: Any) -> dict | None:
+        rid = to_int_string(resource_id)
+        if rid is None:
+            return None
+        return self._one(f"SELECT {self._BOOKMARK_COLUMNS} FROM bookmarks WHERE resource_id = ?", (rid,))
+
+    def upsert_bookmark(
+        self, resource_id: Any, data: dict, note: str | None = None, created_at: int | None = None
+    ) -> bool:
+        rid = to_int_string(resource_id)
+        if rid is None:
+            raise ValueError(f"Not a Hub resource id: {resource_id!r}")
+        payload = json.dumps(data)
+        with self.transaction():
+            if self._one("SELECT 1 FROM bookmarks WHERE resource_id = ?", (rid,)):
+                self._run(
+                    "UPDATE bookmarks SET hub_json = ?, note = COALESCE(?, note) WHERE resource_id = ?",
+                    (payload, note, rid),
+                )
+                return False
+            self._run(
+                "INSERT INTO bookmarks (resource_id, hub_json, note, created_at) VALUES (?, ?, ?, ?)",
+                (rid, payload, note, now() if created_at is None else int(created_at)),
+            )
+            return True
+
+    def set_bookmark_note(self, resource_id: Any, note: str | None) -> int:
+        rid = to_int_string(resource_id)
+        if rid is None:
+            return 0
+        text = (note or "").strip() or None
+        return self._run("UPDATE bookmarks SET note = ? WHERE resource_id = ?", (text, rid)).rowcount
+
+    def delete_bookmark(self, resource_id: Any) -> int:
+        rid = to_int_string(resource_id)
+        if rid is None:
+            return 0
+        return self._run("DELETE FROM bookmarks WHERE resource_id = ?", (rid,)).rowcount
+
+    def count_bookmarks(self) -> int:
+        return self._one("SELECT COUNT(*) AS n FROM bookmarks")["n"]

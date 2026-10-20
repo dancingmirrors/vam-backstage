@@ -40,6 +40,7 @@ gridview > child:hover { background: none; }
 .vb-chip.error { background-color: alpha(#f87171, 0.9); color: #2a0000; }
 .vb-chip.muted { background-color: alpha(currentColor, 0.12); color: inherit; }
 .vb-chip.success { background-color: alpha(#34d399, 0.85); color: #00251a; }
+.vb-chip.bookmark { background-color: alpha(#2dd4bf, 0.9); color: #00241f; }
 
 .vb-card-title { font-weight: 600; font-size: 13px; }
 .vb-card-sub { font-size: 11px; opacity: 0.65; }

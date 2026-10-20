@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -9,9 +10,10 @@ import gi
 from gi.repository import Adw, GLib, Gtk
 
 from .. import __version__
-from ..hub.client import HUB_HOST, is_hub_url, parse_hub_download_url, pick_hub_file
+from ..hub.client import HUB_HOST, is_hub_url, parse_hub_download_url, parse_hub_resource_url, pick_hub_file
 from ..hub.downloads import ensure_var_ext
 from .dispatch import run_async
+from .widgets import icon_or_text_button
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +117,12 @@ class HubWebDialog(Adw.Dialog):
         external = Gtk.Button(icon_name="adw-external-link-symbolic", tooltip_text="Open in your web browser")
         external.connect("clicked", lambda *_: self.open_externally())
         header.pack_end(external)
+        self._bookmark_rid: str | None = None
+        self.bookmark = icon_or_text_button("bookmark-new-symbolic", "Bookmark", "Bookmark this resource")
+        self.bookmark.set_sensitive(False)
+        self.bookmark.connect("clicked", lambda *_: self.toggle_bookmark())
+        header.pack_end(self.bookmark)
+        window.bridge.connect("bookmarks:updated", lambda _p: self._sync_bookmark())
 
         self.progress = Gtk.ProgressBar(valign=Gtk.Align.START, can_target=False, visible=False)
         self.progress.add_css_class("osd")
@@ -145,6 +153,7 @@ class HubWebDialog(Adw.Dialog):
             ("<Alt>Right", self.web.go_forward),
             ("F5", self.web.reload),
             ("<Control>r", self.web.reload),
+            ("<Control>d", self.toggle_bookmark),
         ):
             shortcuts.add_shortcut(
                 Gtk.Shortcut.new(
@@ -223,6 +232,43 @@ class HubWebDialog(Adw.Dialog):
 
         run_async(work, on_done=done, on_error=lambda err: self.window.toast(f"Could not queue the download: {err}", 8))
 
+    def toggle_bookmark(self) -> None:
+        rid = self._bookmark_rid
+        if not rid:
+            return
+        if self.backend.lib.is_bookmarked(rid):
+            self.window.run_op(self.backend.lib.remove_bookmark, rid, success="Bookmark removed")
+            return
+        title = re.sub(r"\s*\|\s*Virt-A-Mate Hub\s*$", "", self.web.get_title() or "", flags=re.IGNORECASE).strip()
+        self.bookmark.set_sensitive(False)
+
+        def done(res):
+            self._sync_bookmark()
+            self.window.toast(f"Bookmarked {res['title']}: listed in the library under Bookmarked")
+
+        def failed(err):
+            self._sync_bookmark()
+            self.window.toast(f"Could not bookmark it: {err}", 8)
+
+        run_async(self.backend.bookmark_resource, rid, None, None, title or None, on_done=done, on_error=failed)
+
+    def _sync_bookmark(self) -> None:
+        rid = parse_hub_resource_url(self.web.get_uri() or "")
+        self._bookmark_rid = rid
+        self.bookmark.set_sensitive(bool(rid))
+        marked = bool(rid) and self.backend.lib.is_bookmarked(rid)
+        if marked:
+            self.bookmark.add_css_class("suggested-action")
+            self.bookmark.set_tooltip_text("Bookmarked; listed in the library under Bookmarked. Click to forget it")
+        else:
+            self.bookmark.remove_css_class("suggested-action")
+            self.bookmark.set_tooltip_text(
+                "Bookmark this resource (Ctrl+D): a note to self in the library under Bookmarked, "
+                "for packages to buy or fetch elsewhere, until the package arrives"
+                if rid
+                else "Open a resource page to bookmark it"
+            )
+
     def _nav_button(self, header: Adw.HeaderBar, icon: str, tip: str, action) -> Gtk.Button:
         button = Gtk.Button(icon_name=icon, tooltip_text=tip)
         button.connect("clicked", lambda *_: action())
@@ -238,6 +284,7 @@ class HubWebDialog(Adw.Dialog):
         self.back.set_sensitive(self.web.can_go_back())
         self.forward.set_sensitive(self.web.can_go_forward())
         self.title_widget.set_subtitle(self.web.get_uri() or "")
+        self._sync_bookmark()
 
     def _sync_progress(self) -> None:
         fraction = self.web.get_estimated_load_progress()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from gi.repository import Adw, GLib, Gtk, Pango
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango
 
 from .models import human_size
 
@@ -64,6 +64,13 @@ def icon_button(icon: str, tooltip: str, on_click: Callable | None = None, flat:
     if on_click:
         btn.connect("clicked", lambda *_: on_click())
     return btn
+
+
+def icon_or_text_button(icon: str, text: str, tooltip: str) -> Gtk.Button:
+    display = Gdk.Display.get_default()
+    if display is not None and Gtk.IconTheme.get_for_display(display).has_icon(icon):
+        return Gtk.Button(icon_name=icon, tooltip_text=tooltip)
+    return Gtk.Button(label=text, tooltip_text=tooltip)
 
 
 def strip_window_drag(root: Gtk.Widget) -> int:
@@ -308,6 +315,9 @@ class PackageCard(Gtk.Box):
         if pkg.get("is_local"):
             self._bind_local(pkg)
             return
+        if pkg.get("is_bookmark"):
+            self._bind_bookmark(pkg)
+            return
         name = pkg.get("hub_display_name") or pkg.get("title") or pkg["package_name"].split(".")[-1]
         self.title.set_text(name)
         self.title.set_tooltip_text(pkg["filename"])
@@ -343,6 +353,8 @@ class PackageCard(Gtk.Box):
             self.state_badges.append(chip("ORPHAN", "warn"))
         elif pkg.get("is_superseded"):
             self.state_badges.append(chip("OLD VERSION", "muted"))
+        elif pkg.get("keep_version"):
+            self.state_badges.append(chip("KEPT", "muted"))
         if state == "enabled":
             self.remove_css_class("disabled")
         else:
@@ -364,6 +376,35 @@ class PackageCard(Gtk.Box):
             self.state_badges.append(chip("MISSING DEPS", "warn"))
         self.remove_css_class("disabled")
         self.thumb.load(self.loader, None)
+
+    def _bind_bookmark(self, b: dict) -> None:
+        self.title.set_text(b["title"])
+        names = b.get("package_names") or []
+        self.title.set_tooltip_text(b["title"] + ("\n" + ", ".join(names[:4]) if names else ""))
+        self.sub.set_text(
+            f"{b['creator']} · v{b['version_string']}" if b.get("version_string") else (b.get("creator") or "Hub")
+        )
+        bits = [b.get("category") or "Free"]
+        if b.get("note"):
+            bits.append(b["note"])
+        elif b.get("tag_line"):
+            bits.append(b["tag_line"])
+        self.meta.set_text(" · ".join(bits))
+        self.meta.set_tooltip_text(b.get("note") or b.get("tag_line") or None)
+        clear_box(self.badges)
+        self.badges.append(category_chip(b.get("type")))
+        self.badges.append(chip("BOOKMARK", "bookmark"))
+        clear_box(self.state_badges)
+        if b.get("installed_filename"):
+            self.state_badges.append(chip("IN LIBRARY", "success"))
+        elif b.get("is_downloadable"):
+            self.state_badges.append(chip("ON HUB", "success"))
+        elif b.get("category") and b["category"] != "Free":
+            self.state_badges.append(chip(b["category"].upper(), "warn"))
+        else:
+            self.state_badges.append(chip("NOT ON HUB", "warn"))
+        self.remove_css_class("disabled")
+        self.thumb.load(self.loader, f"hub-icon:{b['resource_id']}")
 
 
 class ContentCard(Gtk.Box):

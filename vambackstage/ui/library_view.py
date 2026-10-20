@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import Counter
+from urllib.parse import urlsplit
 
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
+from ..core.bookmarks import bookmark_resource_id, is_bookmark_key
 from ..core.content_types import VISIBLE_CATEGORIES
 from ..core.licenses import canonicalize_license
 from ..core.paths import LOCAL_PACKAGE_FILENAME, is_local_package
 from ..hub.client import hub_resource_page_url
 from .dispatch import Debouncer, run_async
-from .launch import open_in_file_manager, open_url
+from .launch import open_in_file_manager, open_url, open_url_externally
 from .models import DictItem, human_size, rebuild_store
 from .widgets import (
     DepRow,
@@ -38,6 +41,7 @@ STATUS_OPTIONS = [
     ("direct", "Installed directly"),
     ("dependency", "Dependencies"),
     ("updates", "Updates available"),
+    ("bookmarked", "Bookmarked"),
     ("missing", "Missing dependencies"),
     ("broken", "Broken"),
     ("corrupted", "Corrupted"),
@@ -46,6 +50,7 @@ STATUS_OPTIONS = [
     ("alias", "Aliases"),
     ("orphan", "Orphaned dependencies"),
     ("superseded", "Old versions"),
+    ("kept", "Kept old versions"),
     ("disabled", "Disabled"),
     ("offloaded", "Offloaded"),
     ("archived", "Archived"),
@@ -70,6 +75,7 @@ class LibraryView(Gtk.Box):
         self.by_filename: dict[str, DictItem] = {}
         self.updates: dict[str, dict] = {}
         self.texture_problems: dict[str, list[dict]] = {}
+        self.bookmarks: list[dict] = []
         self.search_text = ""
         self.status: str | None = None
         self.type_filter: str | None = None
@@ -140,11 +146,19 @@ class LibraryView(Gtk.Box):
         )
         self.old_versions_btn.connect("clicked", lambda *_: self.remove_superseded())
         self.old_versions_btn.set_visible(False)
+        self.bookmarks_btn = Gtk.Button(label="Bookmarks")
+        self.bookmarks_btn.add_css_class("flat")
+        self.bookmarks_btn.set_tooltip_text(
+            "Hub resources you noted for later: paid or external ones to chase down, free ones to install when you get to them"
+        )
+        self.bookmarks_btn.connect("clicked", lambda *_: self.show_status("bookmarked"))
+        self.bookmarks_btn.set_visible(False)
         self._todo_buttons = (
             self.install_missing_btn,
             self.updates_btn,
             self.remove_orphans_btn,
             self.old_versions_btn,
+            self.bookmarks_btn,
         )
         for b in self._todo_buttons:
             self.todo_row.append(b)
@@ -221,6 +235,7 @@ class LibraryView(Gtk.Box):
 
         self._refresh_debounce = Debouncer(150, self.refresh)
         window.bridge.connect("packages:updated", lambda _p: self._refresh_debounce.trigger())
+        window.bridge.connect("bookmarks:updated", lambda _p: self._refresh_debounce.trigger())
         window.bridge.connect("contents:updated", lambda _p: self.detail.refresh())
         window.bridge.connect("thumbnails:updated", self._on_thumbs_updated)
         self.status_list.set_options([(v, t, None) for v, t in STATUS_OPTIONS], None)
@@ -231,13 +246,16 @@ class LibraryView(Gtk.Box):
 
         def load():
             lib = self.backend.lib
-            return lib.list_packages(), lib.status_counts(), lib.local_summary()
+            return lib.list_packages(), lib.status_counts(), lib.local_summary(), lib.bookmarks()
 
         run_async(load, on_done=self._loaded)
 
     def _loaded(self, result):
-        packages, counts, local_row = result
+        packages, counts, local_row, bookmarks = result
         self.packages = packages
+        self.bookmarks = bookmarks
+        self.bookmarks_btn.set_visible(bool(bookmarks))
+        self.bookmarks_btn.set_label(f"Bookmarks ({len(bookmarks)})")
         known = {p["filename"] for p in packages}
         self.updates = {k: u for k, u in self.updates.items() if k in known and u.get("hub_filename") not in known}
         self.updates_btn.set_visible(bool(self.updates))
@@ -248,7 +266,7 @@ class LibraryView(Gtk.Box):
         show_local = bool(local_row) and (
             bool(local_row["missing_deps"]) or LOCAL_PACKAGE_FILENAME in self.texture_problems
         )
-        self.rows = ([local_row] if show_local else []) + packages
+        self.rows = ([local_row] if show_local else []) + packages + bookmarks
         self.global_counts = counts
         selected = self.selected_filename()
         self.by_filename = rebuild_store(self.store, self.rows, lambda p: p["filename"])
@@ -286,7 +304,7 @@ class LibraryView(Gtk.Box):
         options = [(v, t, count_map[v]) for v, t in STATUS_OPTIONS if v in always or count_map[v] or v == self.status]
         self._status_options = options
         self.status_list.set_options(options, self.status)
-        pk = self.packages
+        pk = self.packages + self.bookmarks
         type_pool = [
             d for d in pk if self._status_ok(d, self.status) and self._author_ok(d, self.author) and self._search_ok(d)
         ]
@@ -302,7 +320,7 @@ class LibraryView(Gtk.Box):
             for d in pk
             if self._status_ok(d, self.status) and self._type_ok(d, self.type_filter) and self._search_ok(d)
         ]
-        authors = Counter(d["creator"] for d in author_pool)
+        authors = Counter(d["creator"] for d in author_pool if d["creator"])
         if self.author:
             authors.setdefault(self.author, 0)
         author_opts = [(None, "All authors", len(author_pool))] + [
@@ -336,7 +354,10 @@ class LibraryView(Gtk.Box):
             button, action = "Remove all", "remove_orphans"
         elif self.status == "superseded" and c.get("superseded"):
             n = c["superseded"]
-            title = f"{n} older version{'s' if n != 1 else ''} nothing names by number, each with a newer version installed."
+            title = (
+                f"{n} older version{'s' if n != 1 else ''} nothing names by number, each with a newer version installed. "
+                "Keep this version, in a package's panel, exempts one you want to keep."
+            )
             button, action = "Remove all", "remove_superseded"
         elif self.status == "updates" and self.updates:
             n = len(self.updates)
@@ -349,6 +370,16 @@ class LibraryView(Gtk.Box):
                 "as of the last texture check. Each one lists its files in the panel."
             )
             button, action = "Check again", "check_textures"
+        elif self.status == "bookmarked" and self.bookmarks:
+            n = len(self.bookmarks)
+            k = len(self._installable_bookmarks())
+            title = (
+                f"{n} Hub resource{'s' if n != 1 else ''} noted for later."
+                + (f" {k} can be installed from the Hub now." if k else "")
+                + " Paid or externally hosted ones: open the page, get the file from the creator and drop it into "
+                "AddonPackages; a bookmark clears itself once its package is in your library."
+            )
+            button, action = (f"Install {k} from Hub", "install_bookmarks") if k else ("", "bookmarks_info")
         self._banner_action = action
         if action:
             self.banner.set_title(title)
@@ -366,6 +397,8 @@ class LibraryView(Gtk.Box):
             self.show_updates()
         elif self._banner_action == "check_textures":
             self.window.check_textures()
+        elif self._banner_action == "install_bookmarks":
+            self.install_bookmarks()
 
     def clear_filters(self) -> None:
         self.status = self.type_filter = self.author = None
@@ -375,7 +408,10 @@ class LibraryView(Gtk.Box):
 
     def _update_count(self):
         n = self.sorted.get_n_items()
-        self.count_label.set_text(f"{n} of {len(self.packages)} packages")
+        if self.status == "bookmarked":
+            self.count_label.set_text(f"{n} bookmark{'s' if n != 1 else ''}")
+        else:
+            self.count_label.set_text(f"{n} of {len(self.packages)} packages")
         self.empty.set_visible(n == 0 and len(self.rows) > 0)
         self.grid_scroll.set_visible(n > 0 or len(self.rows) == 0)
         q = self.search.get_text().strip()
@@ -391,6 +427,10 @@ class LibraryView(Gtk.Box):
         self.hub_search_btn.set_label(f"Search the Hub for “{q}”" if q else "Search the Hub")
 
     def _status_ok(self, d: dict, status: str | None) -> bool:
+        if d.get("is_bookmark"):
+            return status == "bookmarked"
+        if status == "bookmarked":
+            return False
         if status == "textures":
             return d["filename"] in self.texture_problems
         if d.get("is_local"):
@@ -419,6 +459,8 @@ class LibraryView(Gtk.Box):
             return bool(d["is_orphan"])
         if status == "superseded":
             return bool(d.get("is_superseded"))
+        if status == "kept":
+            return bool(d.get("keep_version"))
         if status in ("disabled", "offloaded", "archived"):
             return d["storage_state"] == status
         if status == "local":
@@ -572,7 +614,7 @@ class LibraryView(Gtk.Box):
                 if scroll:
                     self.grid.scroll_to(i, Gtk.ListScrollFlags.FOCUS | Gtk.ListScrollFlags.SELECT, None)
                 return
-        self.status = "missing" if is_local_package(filename) else None
+        self.status = "missing" if is_local_package(filename) else ("bookmarked" if is_bookmark_key(filename) else None)
         self.type_filter = None
         self.author = None
         self.search.set_text("")
@@ -727,6 +769,25 @@ class LibraryView(Gtk.Box):
 
     def install_all_missing(self):
         self.window.run_op(self.backend.downloads.enqueue_install_all_missing, then=self._report_install)
+
+    def _installable_bookmarks(self) -> list[dict]:
+        return [b for b in self.bookmarks if b.get("is_downloadable") and not b.get("installed_filename")]
+
+    def install_bookmarks(self):
+        rids = [b["resource_id"] for b in self._installable_bookmarks()]
+        if not rids:
+            self.window.toast("None of the bookmarks can be downloaded from the Hub.")
+            return
+
+        def done(r):
+            msg = f"Queued {r['queued']} download(s)"
+            if r["already"]:
+                msg += f", {r['already']} already in your library or downloading"
+            if r["failed"]:
+                msg += "; failed: " + "; ".join(f"{rid}: {why}" for rid, why in r["failed"][:3])
+            self.window.toast(msg, 10)
+
+        self.window.run_op(self.backend.install_bookmarks, rids, then=done)
 
     def _report_install(self, r: dict) -> None:
         parts = [f"Queued {r['queued']} download(s)"]
@@ -967,6 +1028,15 @@ class PackageDetail(Gtk.Box):
         self.description = label("", "vb-dim", wrap=True)
         self.description.set_selectable(True)
         self.append(self.description)
+        self.note_box = vbox(2, visible=False)
+        self.note_box.append(label("NOTE TO SELF", "vb-section-label"))
+        self.note_entry = Gtk.Entry(placeholder_text="Where to get it, which tier, what for…")
+        self.note_entry.connect("activate", lambda *_: self._save_note())
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda *_: self._save_note())
+        self.note_entry.add_controller(focus)
+        self.note_box.append(self.note_entry)
+        self.append(self.note_box)
         self.textures_box = vbox(2)
         self.append(self.textures_box)
         self.deps_box = vbox(2)
@@ -984,6 +1054,9 @@ class PackageDetail(Gtk.Box):
         if not self.filename:
             return
         fn = self.filename
+        if is_bookmark_key(fn):
+            run_async(self.backend.lib.bookmark_detail, bookmark_resource_id(fn), on_done=lambda d: self._render(fn, d))
+            return
         run_async(self.backend.lib.package_detail, fn, on_done=lambda d: self._render(fn, d))
 
     def _button(self, text: str, cb, style: str | None = None, tooltip: str | None = None) -> Gtk.Button:
@@ -1002,6 +1075,10 @@ class PackageDetail(Gtk.Box):
         self.detail = d
         if d is None:
             self.title.set_text("")
+            return
+        self.note_box.set_visible(bool(d.get("is_bookmark")))
+        if d.get("is_bookmark"):
+            self._render_bookmark(fn, d)
             return
         if d.get("is_local"):
             self._render_local(fn, d)
@@ -1043,16 +1120,19 @@ class PackageDetail(Gtk.Box):
         if d.get("is_superseded"):
             c = chip("OLD VERSION", "muted")
             c.set_tooltip_text(
-                f"Superseded by {d.get('superseded_by')}; nothing refers to this version by number, so it only takes space."
+                f"Superseded by {d.get('superseded_by')}; nothing refers to this version by number, so it only takes space. "
+                "Keep this version exempts it."
+            )
+            self.chips.append(c)
+        if d.get("keep_version"):
+            c = chip("KEPT", "muted")
+            c.set_tooltip_text(
+                "Kept on purpose: this older version stays out of Old versions and is never removed with them."
             )
             self.chips.append(c)
         self._texture_chip(fn)
 
-        child = self.actions.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            self.actions.remove(child)
-            child = nxt
+        self._clear_actions()
         state = d["storage_state"]
         if state == "enabled":
             self._button("Disable", self._toggle_enabled)
@@ -1072,6 +1152,20 @@ class PackageDetail(Gtk.Box):
                 "suggested-action",
                 tooltip="Treat it as a package you chose: it counts as installed directly, is never an orphan, "
                 "and its content is shown in VaM.",
+            )
+        if d.get("is_superseded"):
+            self._button(
+                "Keep this version",
+                lambda: self._set_keep(True),
+                tooltip="An older version you want although a newer one is installed and nothing names this one by "
+                "number: it leaves Old versions, and Remove all never touches it.",
+            )
+        elif d.get("keep_version"):
+            self._button(
+                "Stop keeping",
+                lambda: self._set_keep(False),
+                tooltip="Treat it like any other old version again: listed under Old versions while a newer version is "
+                "installed and nothing names it by number.",
             )
         if d.get("inactive_deps") and state == "enabled":
             self._button(f"Enable {d['inactive_deps']} inactive deps", self._enable_deps)
@@ -1154,11 +1248,7 @@ class PackageDetail(Gtk.Box):
         clear_box(self.chips)
         self.chips.append(chip("LOCAL", "muted"))
         self._texture_chip(fn)
-        child = self.actions.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            self.actions.remove(child)
-            child = nxt
+        self._clear_actions()
         if d.get("missing_deps_total"):
             self._button(f"Install {d['missing_deps_total']} missing", self._install_missing, "suggested-action")
         self._button("Browse content", lambda: self.window.show_content_for_package(fn))
@@ -1189,6 +1279,161 @@ class PackageDetail(Gtk.Box):
                 row.append(chip(f"{len(f['missing'])} MISSING", "warn"))
                 self.dependents_box.append(row)
         clear_box(self.contents_box)
+
+    def _clear_actions(self) -> None:
+        child = self.actions.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.actions.remove(child)
+            child = nxt
+
+    def _render_bookmark(self, fn: str, d: dict):
+        rid = d["resource_id"]
+        self.thumb.set_visible(True)
+        self.thumb.load(self.view.loader, f"hub-icon:{rid}")
+        self.title.set_text(d["title"])
+        parts = [f"by {d['creator']}" if d.get("creator") else "on the Hub"]
+        if d.get("version_string"):
+            parts.append(f"version {d['version_string']}")
+        if d.get("category"):
+            parts.append(d["category"])
+        when = time.strftime("%Y-%m-%d", time.localtime(d["created_at"])) if d.get("created_at") else None
+        self.sub.set_text(" · ".join(parts) + (f"\nBookmarked {when}" if when else ""))
+        self.sub.set_tooltip_text(None)
+        clear_box(self.chips)
+        self.chips.append(category_chip(d.get("type")))
+        self.chips.append(chip("BOOKMARK", "bookmark"))
+        if d.get("category") and d["category"] != "Free":
+            self.chips.append(chip(d["category"].upper(), "warn"))
+        if d.get("license"):
+            self.chips.append(chip(canonicalize_license(d["license"]) or d["license"], "muted"))
+        installed = d.get("installed_filename")
+        if installed:
+            c = chip("IN LIBRARY", "success")
+            c.set_tooltip_text(f"{installed} is a package of this resource.")
+            self.chips.append(c)
+        self._clear_actions()
+        if installed:
+            self._button(
+                "Show in library",
+                lambda: self.view.select_filename(installed),
+                "suggested-action",
+                tooltip=f"Show {installed} in the library",
+            )
+        elif d.get("is_downloadable"):
+            self._button(
+                "Install from Hub",
+                lambda: self._install_bookmark(d),
+                "suggested-action",
+                tooltip="Queue the download together with the dependencies you do not have, as Install on the Hub "
+                "page does. The bookmark clears itself once the package arrives.",
+            )
+        self._button("Open on Hub", lambda: open_url(hub_resource_page_url(rid)))
+        link = d.get("external_link")
+        if link:
+            host = (urlsplit(link).hostname or "link").removeprefix("www.")
+            self._button(f"Open {host}", lambda: open_url_externally(link), tooltip=link)
+        if d.get("package_names"):
+            self._button(
+                "Copy package name",
+                lambda: self._copy_name(d["package_names"][0]),
+                tooltip="Copy the package name for searching elsewhere (Patreon, Discord).",
+            )
+        self._button(
+            "Remove bookmark",
+            lambda: self._remove_bookmark(d),
+            tooltip="Forget this note. Bookmarks also clear themselves once a package of the resource is in your library.",
+        )
+        if installed:
+            text = (
+                f"A package of this resource is already in your library: {installed}. A bookmark clears itself when "
+                "its package arrives after it was noted; this one was there first, so remove the bookmark once it "
+                "has served its purpose."
+            )
+        elif d.get("is_downloadable"):
+            text = (
+                "Noted for later from the Hub. The Hub serves this file, so Install from Hub queues it whenever you "
+                "are ready; the bookmark clears itself once the package is in your library."
+            )
+        else:
+            text = (
+                "Noted for later from the Hub. The Hub offers no download for it (paid, or hosted elsewhere): get the "
+                "file from the creator's page, drop it into AddonPackages, and the bookmark clears itself once a "
+                "package of this resource is in your library."
+            )
+        if d.get("tag_line"):
+            text = d["tag_line"] + "\n\n" + text
+        self.description.set_text(text)
+        self.description.set_visible(True)
+        typing = bool(self.note_entry.get_state_flags() & Gtk.StateFlags.FOCUS_WITHIN)
+        if not typing and self.note_entry.get_text() != (d.get("note") or ""):
+            self.note_entry.set_text(d.get("note") or "")
+        clear_box(self.textures_box)
+        clear_box(self.deps_box)
+        files = d.get("hub_filenames") or []
+        sizes: dict[str, int] = {}
+        for f in (d.get("snapshot") or {}).get("hubFiles") or []:
+            if isinstance(f, dict) and f.get("filename") and str(f.get("file_size") or "").isdigit():
+                name = str(f["filename"])
+                sizes[name if name.lower().endswith(".var") else name + ".var"] = int(f["file_size"])
+        if files:
+            self.deps_box.append(label(f"FILES ON THE HUB ({len(files)})", "vb-section-label"))
+            for name in files:
+                row = hbox(6)
+                row.add_css_class("vb-dep-row")
+                lbl = label(name, "vb-mono vb-small", selectable=True)
+                lbl.set_hexpand(True)
+                row.append(lbl)
+                if name in sizes:
+                    row.append(label(human_size(sizes[name]), "vb-dim vb-small"))
+                row.append(copy_button(name))
+                self.deps_box.append(row)
+        elif d.get("package_names"):
+            self.deps_box.append(label(f"PACKAGES ({len(d['package_names'])})", "vb-section-label"))
+            for name in d["package_names"]:
+                row = hbox(6)
+                row.add_css_class("vb-dep-row")
+                lbl = label(name, "vb-mono vb-small", selectable=True)
+                lbl.set_hexpand(True)
+                row.append(lbl)
+                row.append(copy_button(name))
+                self.deps_box.append(row)
+        clear_box(self.dependents_box)
+        clear_box(self.contents_box)
+
+    def _save_note(self) -> None:
+        d = self.detail
+        if not d or not d.get("is_bookmark"):
+            return
+        text = self.note_entry.get_text().strip()
+        if text == (d.get("note") or ""):
+            return
+        d["note"] = text
+        run_async(
+            self.backend.lib.set_bookmark_note,
+            d["resource_id"],
+            text,
+            on_error=lambda e: self.window.toast(f"Could not save the note: {e}", 8),
+        )
+
+    def _install_bookmark(self, d: dict) -> None:
+        def done(res):
+            n = res["inserted"]
+            if n:
+                msg = f"Queued {n} download(s)"
+            elif res.get("already_queued"):
+                msg = "Already downloading"
+            else:
+                msg = "Already in your library"
+            if res.get("unresolved_deps"):
+                k = len(res["unresolved_deps"])
+                msg += f"; {k} dependenc{'y' if k == 1 else 'ies'} not available on the Hub"
+            self.window.toast(msg, 8)
+
+        self.window.run_op(self.backend.downloads.enqueue_install, d["resource_id"], then=done)
+
+    def _remove_bookmark(self, d: dict) -> None:
+        self.window.run_op(self.backend.lib.remove_bookmark, d["resource_id"], success="Bookmark removed")
 
     def _texture_chip(self, fn: str) -> None:
         problems = self.view.texture_problems.get(fn) or []
@@ -1501,6 +1746,14 @@ class PackageDetail(Gtk.Box):
 
     def _enable_deps(self):
         self.window.run_op(self.backend.lib.enable_deps, self.filename)
+
+    def _set_keep(self, keep: bool):
+        self.window.run_op(
+            self.backend.lib.set_keep_version,
+            self.filename,
+            keep,
+            success="Kept: it stays out of Old versions" if keep else "No longer kept",
+        )
 
     def _install_missing(self):
         def done(r):

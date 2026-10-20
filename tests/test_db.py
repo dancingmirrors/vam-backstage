@@ -251,6 +251,55 @@ def test_labels(db):
     assert db.gc_orphan_labels() == 1
 
 
+def test_bookmarks(db):
+    assert db.count_bookmarks() == 0 and db.get_bookmark("1") is None and db.get_bookmark("null") is None
+    assert db.upsert_bookmark("12", {"title": "T"}, note="n") is True
+    assert db.upsert_bookmark(12, {"title": "T2"}) is False
+    row = db.get_bookmark("12")
+    assert row["note"] == "n" and '"T2"' in row["hub_json"] and row["created_at"] > 0
+    assert db.upsert_bookmark("13", {"title": "Old"}, created_at=5) and db.get_bookmark("13")["created_at"] == 5
+    assert [r["resource_id"] for r in db.list_bookmarks()] == ["12", "13"]
+    assert db.set_bookmark_note("12", "  ") == 1 and db.get_bookmark("12")["note"] is None
+    assert db.set_bookmark_note("12", "x") == 1 and db.set_bookmark_note("99", "x") == 0
+    assert db.set_bookmark_note("null", "x") == 0 and db.delete_bookmark("null") == 0
+    with pytest.raises(ValueError):
+        db.upsert_bookmark("null", {})
+    assert db.count_bookmarks() == 2 and db.delete_bookmark("12") == 1 and db.delete_bookmark("12") == 0
+    assert db.count_bookmarks() == 1
+
+
+def test_bookmarks_table_migrates_from_v5(tmp_path):
+    from vambackstage.core.db import SCHEMA_VERSION, Database
+
+    path = tmp_path / "old.db"
+    db = Database(path)
+    db._conn.execute("DROP TABLE bookmarks")
+    db._conn.execute("PRAGMA user_version = 5")
+    db.close()
+    db = Database(path)
+    assert db._schema_version() == SCHEMA_VERSION
+    assert db.upsert_bookmark("1", {"title": "after"}) and db.count_bookmarks() == 1
+    db.close()
+
+
+def test_packages_keep_version_column_migrates_from_v6(tmp_path):
+    from vambackstage.core.db import SCHEMA_VERSION, Database
+
+    path = tmp_path / "old.db"
+    db = Database(path)
+    db._conn.execute("ALTER TABLE packages DROP COLUMN keep_version")
+    db._conn.execute("PRAGMA user_version = 6")
+    db.close()
+    db = Database(path)
+    assert db._schema_version() == SCHEMA_VERSION
+    db.upsert_package(pkg_row("A.B.1.var"))
+    assert db.get_package("A.B.1.var")["keep_version"] == 0
+    db.set_package_keep_version("A.B.1.var", True)
+    db.upsert_package(pkg_row("A.B.1.var", size_bytes=5))
+    assert db.get_package("A.B.1.var")["keep_version"] == 1, "a rescan keeps the flag"
+    db.close()
+
+
 def test_transaction_rollback(db):
     with pytest.raises(RuntimeError):
         with db.transaction():

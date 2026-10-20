@@ -9,8 +9,9 @@ import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from .bookmarks import PackageMatcher, bookmark_summary, snapshot_of
 from .content_types import VISIBLE_CATEGORIES
-from .db import Database
+from .db import Database, to_int_string
 from .events import EventBus
 from .graph import (
     compute_cascade_disable,
@@ -129,6 +130,9 @@ class Library:
                 on_progress(p)
 
         summary = run_scan(self, progress)
+        arrived = list(dict.fromkeys([*summary.added_filenames, *summary.replaced]))
+        if arrived:
+            self.resolve_bookmarks(arrived)
         self.notify("packages:updated")
         self.notify("contents:updated")
         if summary.added_filenames and self.on_new_packages and not was_initial:
@@ -435,6 +439,19 @@ class Library:
             self.store.build_from_db(skip_graph=True)
         self.notify("packages:updated")
         self.notify("contents:updated")
+        return {"ok": True, "count": len(names)}
+
+    def set_keep_version(self, filenames, keep: bool) -> dict:
+        names = _names(filenames)
+        with self.lock:
+            unknown = [fn for fn in names if fn not in self.store.package_index or is_local_package(fn)]
+            if unknown:
+                raise KeyError(f"Package not found: {unknown[0]}")
+            for fn in names:
+                self.db.set_package_keep_version(fn, keep)
+                self.store.patch_keep_version(fn, keep)
+            self.store.recompute_superseded()
+        self.notify("packages:updated")
         return {"ok": True, "count": len(names)}
 
     def set_type_override(self, filenames, type_override: str | None) -> dict:
@@ -1043,6 +1060,91 @@ class Library:
         log.info("alias packages: %d created, %d skipped", len(created), len(skipped))
         return {"created": created, "skipped": skipped}
 
+    def _bookmark_matcher(self, filenames=None) -> PackageMatcher:
+        return PackageMatcher(self.store.package_index, self.store.is_placeholder, filenames)
+
+    def bookmarks(self) -> list[dict]:
+        with self.lock:
+            matcher = self._bookmark_matcher()
+            return [bookmark_summary(r, matcher) for r in self.db.list_bookmarks()]
+
+    def bookmark_detail(self, resource_id) -> dict | None:
+        with self.lock:
+            row = self.db.get_bookmark(resource_id)
+            return bookmark_summary(row, self._bookmark_matcher()) if row else None
+
+    def bookmarked_resource_ids(self) -> set[str]:
+        return {str(r["resource_id"]) for r in self.db.list_bookmarks()}
+
+    def is_bookmarked(self, resource_id) -> bool:
+        return self.db.get_bookmark(resource_id) is not None
+
+    def add_bookmark(self, resource_id, snapshot: dict | None, note: str | None = None) -> dict:
+        rid = to_int_string(resource_id) or to_int_string((snapshot or {}).get("resource_id"))
+        if rid is None:
+            raise ValueError("Not a Hub resource")
+        data = dict(snapshot or {})
+        data["resource_id"] = rid
+        with self.lock:
+            created = self.db.upsert_bookmark(rid, data, (note or "").strip() or None)
+            summary = bookmark_summary(self.db.get_bookmark(rid), self._bookmark_matcher())
+        self.notify("bookmarks:updated")
+        log.info("bookmark %s: %s (%s)", "added" if created else "refreshed", summary["title"], rid)
+        return {**summary, "created": created}
+
+    def remove_bookmark(self, resource_id) -> bool:
+        with self.lock:
+            removed = self.db.delete_bookmark(resource_id) > 0
+        if removed:
+            self.notify("bookmarks:updated")
+        return removed
+
+    def set_bookmark_note(self, resource_id, note: str | None) -> bool:
+        with self.lock:
+            changed = self.db.set_bookmark_note(resource_id, note) > 0
+        if changed:
+            self.notify("bookmarks:updated")
+        return changed
+
+    def restore_bookmarks(self, items: Iterable[dict]) -> int:
+        n = 0
+        with self.lock:
+            for item in items:
+                try:
+                    snapshot = item.get("snapshot") or {"resource_id": item["resource_id"]}
+                    self.db.upsert_bookmark(
+                        item["resource_id"], snapshot, item.get("note") or None, item.get("created_at")
+                    )
+                except (KeyError, TypeError, ValueError) as err:
+                    log.warning("bookmark not restored: %s", err)
+                    continue
+                n += 1
+        if n:
+            self.notify("bookmarks:updated")
+        return n
+
+    def resolve_bookmarks(self, filenames) -> list[dict]:
+        names = [fn for fn in _names(filenames) if fn]
+        if not names:
+            return []
+        resolved = []
+        with self.lock:
+            arrived = self._bookmark_matcher(names)
+            if arrived.empty:
+                return []
+            for row in self.db.list_bookmarks():
+                fn = arrived.match(snapshot_of(row), row["resource_id"])
+                if fn:
+                    self.db.delete_bookmark(row["resource_id"])
+                    resolved.append({**bookmark_summary(row, arrived), "installed_filename": fn})
+        if resolved:
+            log.info(
+                "bookmarks fulfilled: %s", ", ".join(f"{b['title']} ({b['installed_filename']})" for b in resolved)
+            )
+            self.notify("bookmarks:updated")
+            self.notify("bookmarks:resolved", {"bookmarks": resolved})
+        return resolved
+
     def set_strict_versions(self, on: bool) -> None:
         with self.lock:
             self.db.set_setting("strict_versions", "1" if on else "0")
@@ -1157,6 +1259,7 @@ class Library:
                     except (StorageStateError, OSError) as err:
                         log.warning("Cascade enable failed for %s: %s", dep, err)
             self.store.build_from_db()
+        self.resolve_bookmarks([filename])
         self.notify("packages:updated")
         self.notify("contents:updated")
         if self.on_new_packages and not hub_resource_id:

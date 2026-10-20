@@ -354,8 +354,13 @@ class Store:
             for v, fn in live:
                 if fn == newest_fn or v == newest_v or self.reverse_deps.get(fn):
                     continue
+                if self.package_index[fn].get("keep_version"):
+                    continue
                 self.superseded_set.add(fn)
                 self.superseded_by[fn] = newest_fn
+
+    def recompute_superseded(self) -> None:
+        self._compute_superseded()
 
     def get_superseded_total_size(self) -> int:
         return sum(
@@ -499,6 +504,11 @@ class Store:
             for item in self.content_by_package.get(fn, ()):
                 item["storage_state"] = storage_state
 
+    def patch_keep_version(self, filename: str, keep: bool) -> None:
+        pkg = self.package_index.get(filename)
+        if pkg:
+            pkg["keep_version"] = 1 if keep else 0
+
     def patch_direct(self, filename: str, is_direct: bool) -> None:
         pkg = self.package_index.get(filename)
         if pkg:
@@ -576,6 +586,7 @@ class Store:
             "is_orphan": fn in self.orphan_set,
             "is_superseded": fn in self.superseded_set,
             "superseded_by": self.superseded_by.get(fn),
+            "keep_version": bool(pkg.get("keep_version")),
             "is_cascade_orphan": fn in self.orphan_set and fn not in self.direct_orphan_set,
             "is_local_only": self.is_not_downloadable(pkg),
             "is_hub_replaceable": fn in self.replaceable_set,
@@ -745,6 +756,7 @@ class Store:
             "is_cascade_orphan": False,
             "is_superseded": False,
             "superseded_by": None,
+            "keep_version": False,
             "is_local_only": True,
             "is_hub_replaceable": False,
             "no_look_preset_tag": False,
