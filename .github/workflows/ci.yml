@@ -53,6 +53,8 @@ jobs:
         env:
           GSK_RENDERER: cairo
           GDK_BACKEND: x11
+          GTK_A11Y: none
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"
         run: |
           set -o pipefail
           xvfb-run -a -s "-screen 0 1400x900x24" python3 -m vambackstage --data-dir ci-data --vam-dir "$PWD/demo-vam" --quit-after 8 --screenshot screenshot-${{ matrix.os }}.png
