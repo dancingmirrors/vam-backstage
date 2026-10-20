@@ -611,13 +611,48 @@ class MainWindow(Adw.ApplicationWindow):
         hubweb.show(self.backend, self, None).load_html(hubweb.DEMO_HTML)
 
     def save_screenshot(self, path: str) -> None:
-        paintable = Gtk.WidgetPaintable.new(self)
-        w, h = paintable.get_intrinsic_width(), paintable.get_intrinsic_height()
-        snapshot = Gtk.Snapshot()
-        paintable.snapshot(snapshot, w, h)
-        node = snapshot.to_node()
+        node = self._render_node()
+        if node is None:
+            node = self._render_node_after_paint()
         if node is None:
             raise RuntimeError("nothing to render")
         texture = self.get_native().get_renderer().render_texture(node, None)
         texture.save_to_png(path)
         log.info("screenshot saved to %s", path)
+
+    def _render_node(self):
+        paintable = Gtk.WidgetPaintable.new(self)
+        snapshot = Gtk.Snapshot()
+        paintable.snapshot(snapshot, paintable.get_intrinsic_width(), paintable.get_intrinsic_height())
+        return snapshot.to_node()
+
+    def _render_node_after_paint(self, timeout_ms: int = 2000):
+        clock = self.get_frame_clock()
+        if clock is None:
+            return None
+        found: list = []
+        expired: list = []
+
+        def on_after_paint(_clock):
+            node = self._render_node()
+            if node is not None:
+                found.append(node)
+            else:
+                self.queue_draw()
+
+        def give_up():
+            expired.append(True)
+            return False
+
+        handler = clock.connect("after-paint", on_after_paint)
+        watchdog = GLib.timeout_add(timeout_ms, give_up)
+        context = GLib.MainContext.default()
+        try:
+            self.queue_draw()
+            while not found and not expired:
+                context.iteration(True)
+        finally:
+            clock.disconnect(handler)
+            if not expired:
+                GLib.source_remove(watchdog)
+        return found[0] if found else None
