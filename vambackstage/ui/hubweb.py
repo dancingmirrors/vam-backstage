@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
@@ -32,8 +33,17 @@ DEMO_HTML = (
     "<h1>Hub pages open here</h1><p>Smoke-test page: the real dialog loads hub.virtamate.com.</p></body></html>"
 )
 _TEN_YEARS = 10 * 365 * 24 * 3600
+DEFAULT_STALL_TIMEOUT_S = 25
 _session = None
 _dialog: HubWebDialog | None = None
+
+
+def _stall_timeout() -> int:
+    try:
+        override = int(os.environ.get("VAM_BACKSTAGE_HUB_TIMEOUT", "") or 0)
+    except ValueError:
+        override = 0
+    return min(override, 600) if override > 0 else DEFAULT_STALL_TIMEOUT_S
 
 
 def available() -> bool:
@@ -58,6 +68,27 @@ def show(backend, window, url: str | None) -> HubWebDialog:
         _dialog.load(url)
     _dialog.present(window)
     return _dialog
+
+
+def _reset_session() -> None:
+    global _session
+    _session = None
+
+
+def _collect_released() -> bool:
+    gc.collect()
+    return False
+
+
+def hard_reset(backend, window, url: str | None) -> HubWebDialog:
+    global _dialog
+    old, _dialog = _dialog, None
+    if old is not None:
+        old._release()
+    _reset_session()
+    dialog = show(backend, window, url)
+    GLib.idle_add(_collect_released)
+    return dialog
 
 
 def _open_externally(url: str) -> None:
@@ -102,6 +133,8 @@ class HubWebDialog(Adw.Dialog):
         self._failed: str | None = None
         self._passthrough: str | None = None
         self._handled: set[str] = set()
+        self._watchdog: int | None = None
+        self._stalled = False
         self.web = WebKit.WebView(network_session=_network_session(backend))
         settings = self.web.get_settings()
         settings.set_enable_developer_extras(False)
@@ -122,7 +155,7 @@ class HubWebDialog(Adw.Dialog):
         self.bookmark.set_sensitive(False)
         self.bookmark.connect("clicked", lambda *_: self.toggle_bookmark())
         header.pack_end(self.bookmark)
-        window.bridge.connect("bookmarks:updated", lambda _p: self._sync_bookmark())
+        self._bridge_off = window.bridge.connect("bookmarks:updated", lambda _p: self._sync_bookmark())
 
         self.progress = Gtk.ProgressBar(valign=Gtk.Align.START, can_target=False, visible=False)
         self.progress.add_css_class("osd")
@@ -175,14 +208,28 @@ class HubWebDialog(Adw.Dialog):
 
     def load(self, url: str) -> None:
         self._wanted = url
+        self._stalled = False
         self.web.load_uri(url)
 
     def retry(self) -> None:
         target = self._failed or self._wanted
-        if target:
-            self.web.load_uri(target)
+        if self._stalled:
+            self._cancel_watchdog()
+            GLib.idle_add(self._hard_retry, target)
+        elif target:
+            self.load(target)
         else:
             self.web.reload()
+
+    def _hard_retry(self, target: str | None) -> bool:
+        if _dialog is not self:
+            return False
+        hard_reset(self.backend, self.window, target)
+        return False
+
+    def _release(self) -> None:
+        self._bridge_off()
+        self.force_close()
 
     def load_html(self, html: str) -> None:
         self.web.load_html(html, None)
@@ -341,21 +388,52 @@ class HubWebDialog(Adw.Dialog):
         decision.ignore()
         return True
 
+    def _arm_watchdog(self) -> None:
+        self._cancel_watchdog()
+        self._watchdog = GLib.timeout_add_seconds(_stall_timeout(), self._on_stall)
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog is not None:
+            GLib.source_remove(self._watchdog)
+            self._watchdog = None
+
+    def _on_stall(self) -> bool:
+        self._watchdog = None
+        if self.get_parent() is None:
+            return False
+        target = self.web.get_uri() or self._wanted or ""
+        log.warning("Hub page got no reply after %ss, giving up: %s", _stall_timeout(), target)
+        self.web.stop_loading()
+        self.progress.set_visible(False)
+        self._failed = target or None
+        self._stalled = True
+        self._show_status(
+            "The Hub isn't responding",
+            f"No reply after {_stall_timeout()} seconds. The connection to the Hub may have dropped "
+            "while idle. Try again to reconnect, or open the page in your web browser.",
+        )
+        return False
+
     def _on_load_changed(self, _web, event) -> None:
         if event == WebKit.LoadEvent.STARTED:
+            self._stalled = False
+            self._arm_watchdog()
             self.stack.set_visible_child_name("web")
         elif event == WebKit.LoadEvent.COMMITTED:
+            self._cancel_watchdog()
             self._handled.clear()
             self._failed = None
         elif event == WebKit.LoadEvent.FINISHED:
+            self._cancel_watchdog()
             self.progress.set_visible(False)
         self._sync_nav()
 
     def _on_load_failed(self, _web, _event, failing_uri: str, error: GLib.Error) -> bool:
+        self._cancel_watchdog()
         if error.matches(WebKit.NetworkError.quark(), WebKit.NetworkError.CANCELLED) or error.matches(
             WebKit.PolicyError.quark(), WebKit.PolicyError.FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE
         ):
-            if not self.web.get_uri():
+            if not self.web.get_uri() and not self._stalled:
                 self._show_status(
                     "Nothing to show here",
                     "That link was passed on: a package goes to the download queue, anything else to your web browser.",
@@ -381,6 +459,7 @@ class HubWebDialog(Adw.Dialog):
         )
 
     def _on_closed(self, *_) -> None:
+        self._cancel_watchdog()
         self.web.stop_loading()
         self._passthrough = None
         self._handled.clear()
