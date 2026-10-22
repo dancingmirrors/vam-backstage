@@ -7,7 +7,7 @@ from gi.repository import Gio, Gtk
 
 from ..core.content_types import VISIBLE_CATEGORIES
 from .dispatch import Debouncer, run_async
-from .models import DictItem, rebuild_store
+from .models import DictItem, sync_store
 from .widgets import (
     ContentCard,
     DepRow,
@@ -55,6 +55,7 @@ class ContentView(Gtk.Box):
         self.package_filter: str | None = None
         self.deps_filter: str | None = None
         self._pending_select: str | None = None
+        self._bound_cards: dict[str, ContentCard] = {}
         self._loaded_once = False
 
         side = vbox(2)
@@ -118,7 +119,8 @@ class ContentView(Gtk.Box):
         self.selection.set_can_unselect(True)
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", lambda f, it: it.set_child(ContentCard(self.loader)))
-        factory.connect("bind", lambda f, it: it.get_child().bind(it.get_item().data))
+        factory.connect("bind", self._bind_card)
+        factory.connect("unbind", self._unbind_card)
         self.grid = Gtk.GridView.new(self.selection, factory)
         self.grid.set_max_columns(14)
         self.grid.set_margin_start(8)
@@ -160,18 +162,25 @@ class ContentView(Gtk.Box):
         )
         self.add_controller(escape)
 
-        self._refresh_debounce = Debouncer(200, self.refresh)
+        self._stale = True
+        self._refresh_debounce = Debouncer(200, self.refresh, 3000, lambda: self.backend.downloads.busy)
         window.bridge.connect("contents:updated", lambda _p: self._refresh_debounce.trigger())
         window.bridge.connect("packages:updated", lambda _p: self._refresh_debounce.trigger())
         self.visibility_list.set_options([(v, t, None) for v, t in VISIBILITY_OPTIONS], None)
         self.state_list.set_options([(v, t, None) for v, t in PKG_STATE_OPTIONS], "enabled")
 
     def on_shown(self):
-        if not self._loaded_once:
+        if self._stale:
             self.refresh()
+
+    def refresh_soon(self):
+        self._refresh_debounce.hurry()
 
     def refresh(self):
         if not self.backend.lib.is_configured:
+            return
+        self._stale = self.window.stack.get_visible_child() is not self
+        if self._stale:
             return
         self._loaded_once = True
 
@@ -188,7 +197,13 @@ class ContentView(Gtk.Box):
             "favorites": sum(1 for c in items if c["favorite"]),
         }
         selected = self.selected_key()
-        self.by_key = rebuild_store(self.store, items, lambda c: f"{c['package_filename']}\0{c['internal_path']}")
+        self.by_key, changed = sync_store(
+            self.store, items, lambda c: f"{c['package_filename']}\0{c['internal_path']}", getattr(self, "by_key", {})
+        )
+        for item in changed:
+            card = self._bound_cards.get(item.key)
+            if card is not None:
+                card.bind(item.data)
         cats = [(None, "All categories", len(items))] + [
             (c, c, type_counts.get(c, 0)) for c in VISIBLE_CATEGORIES if type_counts.get(c)
         ]
@@ -205,13 +220,14 @@ class ContentView(Gtk.Box):
         n_missing = sum(1 for c in items if c.get("missing_refs"))
         if not n_missing and self.deps_filter:
             self.deps_filter = None
+            self.filter.changed(Gtk.FilterChange.LESS_STRICT)
         self.deps_list.set_options(
             [(None, "All items", len(items)), ("missing", "Missing something", n_missing)], self.deps_filter
         )
         self._update_count()
         pending, self._pending_select = self._pending_select, None
         for want in (pending, selected):
-            if not want:
+            if not want or (want is not pending and self.selected_key() == want):
                 continue
             for i in range(self.filtered.get_n_items()):
                 if self.filtered.get_item(i).key == want:
@@ -223,6 +239,16 @@ class ContentView(Gtk.Box):
                 continue
             break
         self.detail.refresh()
+
+    def _bind_card(self, _factory, list_item):
+        item = list_item.get_item()
+        list_item.get_child().bind(item.data)
+        self._bound_cards[item.key] = list_item.get_child()
+
+    def _unbind_card(self, _factory, list_item):
+        key = list_item.get_item().key
+        if self._bound_cards.get(key) is list_item.get_child():
+            del self._bound_cards[key]
 
     def select_item(self, package_filename: str, internal_path: str) -> None:
         key = f"{package_filename}\0{internal_path}"
@@ -440,6 +466,20 @@ class ContentDetail(Gtk.Box):
             )
             for n in sorted(nodes, key=lambda n: (not n.get("missing"), n["ref"].lower())):
                 self.refs_box.append(DepRow(n, 0, self.view.window.select_package, strict=strict, on_dummy=make_dummy))
+            b = Gtk.Button(label="Reinstall what it uses…")
+            b.set_halign(Gtk.Align.START)
+            b.set_tooltip_text(
+                "Download the packages this file refers to, and what they depend on, again at the versions it "
+                "names: a version it asks for that you do not have is added next to the one you have. "
+                "Shows the plan before anything is downloaded."
+            )
+            b.connect(
+                "clicked",
+                lambda *_: self.view.window.reinstall_with_deps(
+                    local_paths=[c["internal_path"]], heading=f"Reinstall what {c['display_name']} uses?"
+                ),
+            )
+            self.refs_box.append(b)
             return
         missing = c.get("missing_refs") or []
         if missing:

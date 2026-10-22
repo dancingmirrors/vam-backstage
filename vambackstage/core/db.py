@@ -12,7 +12,7 @@ from typing import Any
 
 from .paths import LOCAL_PACKAGE_DISPLAY_NAME, LOCAL_PACKAGE_FILENAME
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _INT_RE = re.compile(r"[0-9]+")
 
@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS downloads (
   created_at      INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
   completed_at    INTEGER,
   auto_queue_deps INTEGER NOT NULL DEFAULT 1,
-  reinstall       INTEGER NOT NULL DEFAULT 0
+  reinstall       INTEGER NOT NULL DEFAULT 0,
+  quiet           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS hub_resources (
@@ -196,6 +197,7 @@ MIGRATIONS: list[tuple[int, Any]] = [
     (5, _add_column("packages", "is_unpacked", "INTEGER NOT NULL DEFAULT 0")),
     (6, lambda conn: conn.execute(_BOOKMARKS_TABLE)),
     (7, _add_column("packages", "keep_version", "INTEGER NOT NULL DEFAULT 0")),
+    (8, _add_column("downloads", "quiet", "INTEGER NOT NULL DEFAULT 0")),
 ]
 
 
@@ -690,15 +692,17 @@ class Database:
             "display_name": None,
             "auto_queue_deps": 1,
             "reinstall": 0,
+            "quiet": 0,
         }
         row.update(entry)
         row["hub_resource_id"] = to_int_string(row.get("hub_resource_id"))
         row["reinstall"] = 1 if row.get("reinstall") else 0
+        row["quiet"] = 1 if row.get("quiet") else 0
         return self._run(
             """INSERT OR IGNORE INTO downloads (package_ref, hub_resource_id, download_url, file_size,
-                 priority, parent_ref, display_name, auto_queue_deps, reinstall, status)
+                 priority, parent_ref, display_name, auto_queue_deps, reinstall, quiet, status)
                VALUES (:package_ref, :hub_resource_id, :download_url, :file_size, :priority, :parent_ref,
-                 :display_name, :auto_queue_deps, :reinstall, 'queued')""",
+                 :display_name, :auto_queue_deps, :reinstall, :quiet, 'queued')""",
             row,
         ).rowcount
 
@@ -766,8 +770,14 @@ class Database:
 
     def retry_download(self, dl_id: int) -> None:
         self._run(
-            "UPDATE downloads SET status = 'queued', error = NULL, created_at = 0 WHERE id = ? AND status = 'failed'",
+            "UPDATE downloads SET status = 'queued', error = NULL, created_at = 0, quiet = 0 WHERE id = ? AND status = 'failed'",
             (dl_id,),
+        )
+
+    def has_pending_quiet_downloads(self) -> bool:
+        return (
+            self._one("SELECT 1 AS x FROM downloads WHERE quiet = 1 AND status IN ('queued', 'active') LIMIT 1")
+            is not None
         )
 
     def delete_download(self, dl_id: int) -> None:

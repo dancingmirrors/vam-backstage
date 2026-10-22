@@ -285,6 +285,7 @@ class PackageCard(Gtk.Box):
     def __init__(self, loader, width: int = 190):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.loader = loader
+        self.bound: dict | None = None
         self.add_css_class("vb-card")
         self.set_size_request(width, -1)
         self.thumb = Thumb(width, int(width * 0.72))
@@ -312,6 +313,9 @@ class PackageCard(Gtk.Box):
         self.append(body)
 
     def bind(self, pkg: dict) -> None:
+        if pkg is self.bound:
+            return
+        self.bound = pkg
         if pkg.get("is_local"):
             self._bind_local(pkg)
             return
@@ -411,6 +415,7 @@ class ContentCard(Gtk.Box):
     def __init__(self, loader, size: int = 150):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.loader = loader
+        self.bound: dict | None = None
         self.add_css_class("vb-card")
         self.set_size_request(size, -1)
         self.thumb = Thumb(size, size)
@@ -436,6 +441,9 @@ class ContentCard(Gtk.Box):
         self.append(body)
 
     def bind(self, item: dict) -> None:
+        if item is self.bound:
+            return
+        self.bound = item
         self.title.set_text(item["display_name"])
         self.title.set_tooltip_text(item["internal_path"])
         owner = item.get("package_title") or item.get("package_name") or ""
@@ -488,9 +496,13 @@ class FilterList(Gtk.Box):
         self._group: Gtk.CheckButton | None = None
         self._buttons: dict[str | None, Gtk.CheckButton] = {}
         self._selected: str | None = None
+        self._options: list[tuple[str | None, str, int | None]] = []
         self._updating = False
 
     def set_options(self, options: list[tuple[str | None, str, int | None]], selected: str | None = ...) -> None:
+        if options == self._options and (selected is ... or selected == self._selected):
+            return
+        self._options = list(options)
         self._updating = True
         if selected is not ...:
             self._selected = selected
@@ -511,17 +523,26 @@ class FilterList(Gtk.Box):
             row.set_group(self._group)
             row.set_active(value == self._selected)
             row.connect("toggled", self._on_toggled, value)
-            row.set_visible(self._expanded or i < self.show_more_after or value == self._selected)
+            row.set_visible(self._shown(i, value))
             self._rows.append(row)
             self._buttons[value] = row
         self._more.set_visible(len(options) > self.show_more_after)
         self._more.set_label("Show less" if self._expanded else f"Show {len(options) - self.show_more_after} more")
         self._updating = False
 
+    def _shown(self, i: int, value) -> bool:
+        return self._expanded or i < self.show_more_after or value == self._selected
+
+    def _set_selected(self, value) -> None:
+        old, self._selected = self._selected, value
+        for i, (v, btn) in enumerate(self._buttons.items()):
+            if v in (old, value):
+                btn.set_visible(self._shown(i, v))
+
     def _toggle_more(self, *_):
         self._expanded = not self._expanded
         for i, (value, btn) in enumerate(self._buttons.items()):
-            btn.set_visible(self._expanded or i < self.show_more_after or value == self._selected)
+            btn.set_visible(self._shown(i, value))
         self._more.set_label(
             "Show less" if self._expanded else f"Show {len(self._buttons) - self.show_more_after} more"
         )
@@ -529,7 +550,7 @@ class FilterList(Gtk.Box):
     def _on_toggled(self, btn: Gtk.CheckButton, value) -> None:
         if self._updating or not btn.get_active():
             return
-        self._selected = value
+        self._set_selected(value)
         self.on_change(value)
 
     @property
@@ -537,7 +558,7 @@ class FilterList(Gtk.Box):
         return self._selected
 
     def select(self, value) -> None:
-        self._selected = value
+        self._set_selected(value)
         btn = self._buttons.get(value)
         if btn:
             self._updating = True

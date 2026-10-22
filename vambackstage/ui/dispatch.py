@@ -76,15 +76,33 @@ class EventBridge:
 
 class Debouncer:
 
-    def __init__(self, delay_ms: int, fn: Callable[[], None]):
+    def __init__(
+        self,
+        delay_ms: int,
+        fn: Callable[[], None],
+        min_interval_ms: int = 0,
+        throttle_if: Callable[[], bool] | None = None,
+    ):
         self.delay_ms = delay_ms
         self.fn = fn
+        self.min_interval_ms = min_interval_ms
+        self.throttle_if = throttle_if
         self._source: int | None = None
+        self._last_done = 0
+
+    def _throttled(self) -> bool:
+        return bool(self.min_interval_ms) and (self.throttle_if is None or self.throttle_if())
 
     def trigger(self) -> None:
+        throttled = self._throttled()
         if self._source is not None:
+            if throttled:
+                return
             GLib.source_remove(self._source)
-        self._source = GLib.timeout_add(self.delay_ms, self._fire)
+        wait = self.delay_ms
+        if throttled and self._last_done:
+            wait = max(wait, self.min_interval_ms - (GLib.get_monotonic_time() - self._last_done) // 1000)
+        self._source = GLib.timeout_add(int(wait), self._fire)
 
     def _fire(self) -> bool:
         self._source = None
@@ -92,7 +110,13 @@ class Debouncer:
             self.fn()
         except Exception:
             log.exception("debounced callback failed")
+        self._last_done = GLib.get_monotonic_time()
         return False
+
+    def hurry(self) -> None:
+        if self._source is not None:
+            GLib.source_remove(self._source)
+            self._source = GLib.timeout_add(self.delay_ms, self._fire)
 
     def cancel(self) -> None:
         if self._source is not None:

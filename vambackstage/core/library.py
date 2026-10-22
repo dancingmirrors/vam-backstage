@@ -1183,6 +1183,19 @@ class Library:
         self.notify("contents:updated")
         return {"filename": filename, "package_name": result.package_name, "landed": pkg["storage_state"]}
 
+    def apply_hub_detail(self, filename: str, hub_detail: dict | None) -> None:
+        if not hub_detail or hub_detail.get("_unavailable"):
+            return
+        with self.lock:
+            before = self.db.get_package(filename)
+            self.db.apply_hub_detail_to_package(filename, hub_detail)
+            after = self.db.get_package(filename)
+            stamp = "hub_detail_applied_at"
+            if not before or not after or (before[stamp] and {**before, stamp: None} == {**after, stamp: None}):
+                return
+            self.store.build_from_db(skip_graph=True)
+        self.notify("packages:updated")
+
     def integrate_new_var(
         self, full_path: str, *, is_direct: bool = False, hub_resource_id=None, hub_detail: dict | None = None
     ) -> dict | None:

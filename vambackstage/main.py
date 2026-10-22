@@ -119,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .ui.app import App
 
+    sys.setswitchinterval(0.0005)
     app = App(
         backend,
         quit_after=args.quit_after,

@@ -99,7 +99,6 @@ class Store:
         self.content_items_deduped: list[dict] = []
         self.content_by_package: dict[str, list[dict]] = {}
         self.prefs_map: PrefsMap = {}
-        self.removable_size_map: dict[str, int] = {}
         self.morph_count_by_package: dict[str, int] = {}
         self.look_item_count_by_package: dict[str, int] = {}
         self.aggregate_morph_count_map: dict[str, int] = {}
@@ -269,7 +268,6 @@ class Store:
         self._compute_transitive_missing()
         self._compute_transitive_inactive()
         self._compute_stats()
-        self._compute_all_removable_sizes()
         self._compute_all_morph_counts()
         self._compute_orphan_sets()
         self.refresh_labels()
@@ -303,15 +301,6 @@ class Store:
 
     def get_label_list(self) -> list[dict]:
         return sorted(self.label_index.values(), key=lambda row: row["name"].casefold())
-
-    def _compute_all_removable_sizes(self) -> None:
-        self.removable_size_map = {}
-        for fn in self.package_index:
-            r = compute_removable_deps(
-                fn, self.package_index, self.forward_deps, self.reverse_deps, self.replaceable_set
-            )
-            if r.removable_size > 0:
-                self.removable_size_map[fn] = r.removable_size
 
     def _compute_all_morph_counts(self) -> None:
         self.aggregate_morph_count_map = {}
@@ -429,7 +418,6 @@ class Store:
 
     def recompute_demand_aggregates(self) -> None:
         self._compute_orphan_sets()
-        self._compute_all_removable_sizes()
         self.recompute_inactive_deps()
 
     def _compute_stats(self) -> None:
@@ -560,7 +548,6 @@ class Store:
             "description": pkg.get("description"),
             "license": pkg.get("license"),
             "size_bytes": pkg.get("size_bytes") or 0,
-            "removable_size": self.removable_size_map.get(fn, 0),
             "is_direct": bool(pkg.get("is_direct")),
             "storage_state": pkg.get("storage_state") or "enabled",
             "library_dir_id": pkg.get("library_dir_id"),
@@ -730,7 +717,6 @@ class Store:
             "description": None,
             "license": None,
             "size_bytes": 0,
-            "removable_size": 0,
             "is_direct": True,
             "storage_state": "enabled",
             "library_dir_id": None,

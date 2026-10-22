@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import Counter
+
 from gi.repository import Adw, Gtk
 
 from .dispatch import Debouncer, run_async
@@ -7,6 +9,7 @@ from .models import human_size
 from .widgets import chip, hbox, icon_button, label
 
 STATUS_STYLE = {"queued": "muted", "active": "success", "completed": "success", "failed": "error", "cancelled": "muted"}
+MAX_ROWS = 300
 
 
 class DownloadRow(Gtk.Box):
@@ -15,6 +18,7 @@ class DownloadRow(Gtk.Box):
         self.add_css_class("vb-download-row")
         self.view = view
         self.id = d["id"]
+        self.shape = self.shape_of(d)
         top = hbox(8)
         self.title = label(d.get("display_name") or d["package_ref"])
         self.title.set_hexpand(True)
@@ -39,7 +43,12 @@ class DownloadRow(Gtk.Box):
         self.append(self.info)
         self.update(d)
 
+    @staticmethod
+    def shape_of(d: dict) -> tuple:
+        return d["status"], d.get("priority"), d.get("display_name"), d["package_ref"], d.get("parent_ref")
+
     def update(self, d: dict):
+        self.data = d
         self.bar.set_fraction(min(1.0, (d.get("progress") or 0) / 100))
         self.bar.set_visible(d["status"] in ("queued", "active", "completed"))
         size = d.get("file_size")
@@ -122,7 +131,14 @@ class DownloadsView(Gtk.Box):
         )
         self.stack.add_named(self.empty, "empty")
         self.append(self.stack)
-        self._refresh_debounce = Debouncer(100, self.refresh)
+        self.more = label("", "vb-dim vb-small")
+        self.more.set_margin_top(8)
+        self.more.set_margin_bottom(8)
+        self.more.set_margin_start(10)
+        self.more_row = Gtk.ListBoxRow(child=self.more, activatable=False, selectable=False, visible=False)
+        self.list.append(self.more_row)
+        self.order: list[int] = []
+        self._refresh_debounce = Debouncer(100, self.refresh, 1000, lambda: self.backend.downloads.busy)
         window.bridge.connect("downloads:updated", lambda _p: self._refresh_debounce.trigger())
         window.bridge.connect("download:progress", self._on_progress)
 
@@ -130,6 +146,8 @@ class DownloadsView(Gtk.Box):
         self.refresh()
 
     def refresh(self):
+        if self.window.stack.get_visible_child() is not self:
+            return
         run_async(self.backend.downloads.list, on_done=self._loaded)
 
     def _loaded(self, items: list[dict]):
@@ -138,12 +156,12 @@ class DownloadsView(Gtk.Box):
             items,
             key=lambda d: (order.get(d["status"], 9), 0 if d["priority"] == "direct" else 1, d["created_at"], d["id"]),
         )
-        clear_box_list(self.list)
-        self.rows = {}
-        for d in items:
-            row = DownloadRow(self, d)
-            self.rows[d["id"]] = row
-            self.list.append(row)
+        self._place_rows(items[:MAX_ROWS])
+        rest = Counter(d["status"] for d in items[MAX_ROWS:])
+        self.more.set_text(
+            f"{len(items) - MAX_ROWS} more not listed: " + ", ".join(f"{n} {s}" for s, n in rest.items())
+        )
+        self.more_row.set_visible(len(items) > MAX_ROWS)
         self.stack.set_visible_child_name("list" if items else "empty")
         active = sum(1 for d in items if d["status"] in ("active", "queued"))
         done = sum(1 for d in items if d["status"] == "completed")
@@ -151,6 +169,25 @@ class DownloadsView(Gtk.Box):
         self.summary.set_text(f"{active} in progress · {done} completed · {failed} failed")
         paused = self.backend.downloads.paused
         self.pause_btn.set_label("Resume all" if paused else "Pause all")
+
+    def _place_rows(self, shown: list[dict]) -> None:
+        want = {d["id"]: d for d in shown}
+        for i, row in list(self.rows.items()):
+            d = want.get(i)
+            if d is None or row.shape != DownloadRow.shape_of(d):
+                self.list.remove(row.get_parent())
+                del self.rows[i]
+            elif d != row.data:
+                row.update(d)
+        if [i for i in self.order if i in self.rows] != [i for i in want if i in self.rows]:
+            for row in self.rows.values():
+                self.list.remove(row.get_parent())
+            self.rows = {}
+        for k, d in enumerate(shown):
+            if d["id"] not in self.rows:
+                self.rows[d["id"]] = DownloadRow(self, d)
+                self.list.insert(self.rows[d["id"]], k)
+        self.order = list(want)
 
     def _on_progress(self, p: dict):
         row = self.rows.get(p.get("id"))
@@ -162,11 +199,3 @@ class DownloadsView(Gtk.Box):
             self.backend.downloads.resume_all()
         else:
             self.backend.downloads.pause_all()
-
-
-def clear_box_list(listbox: Gtk.ListBox) -> None:
-    child = listbox.get_first_child()
-    while child is not None:
-        nxt = child.get_next_sibling()
-        listbox.remove(child)
-        child = nxt

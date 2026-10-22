@@ -14,7 +14,7 @@ from ..core.paths import LOCAL_PACKAGE_FILENAME, is_local_package
 from ..hub.client import hub_resource_page_url
 from .dispatch import Debouncer, run_async
 from .launch import open_in_file_manager, open_url, open_url_externally
-from .models import DictItem, human_size, rebuild_store
+from .models import DictItem, human_size, sync_store
 from .widgets import (
     DepRow,
     FilterList,
@@ -75,6 +75,7 @@ class LibraryView(Gtk.Box):
         self.by_filename: dict[str, DictItem] = {}
         self.updates: dict[str, dict] = {}
         self.texture_problems: dict[str, list[dict]] = {}
+        self._filter_inputs: tuple[frozenset, frozenset] = (frozenset(), frozenset())
         self.bookmarks: list[dict] = []
         self.search_text = ""
         self.status: str | None = None
@@ -116,6 +117,16 @@ class LibraryView(Gtk.Box):
         bar.set_margin_bottom(6)
         self.count_label = label("", "vb-dim")
         bar.append(self.count_label)
+        self.reinstall_shown_btn = Gtk.Button(label="Reinstall all shown…")
+        self.reinstall_shown_btn.add_css_class("flat")
+        self.reinstall_shown_btn.set_tooltip_text(
+            "Download every package the list shows again, with everything each depends on, at the versions they "
+            "name: versions asked for that you do not have are added next to the ones you have. With no filter "
+            "that is your whole library; filter by status, type, author or search to narrow it. "
+            "The plan is shown before anything is downloaded, and what the Hub no longer has is skipped."
+        )
+        self.reinstall_shown_btn.connect("clicked", lambda *_: self.reinstall_shown())
+        bar.append(self.reinstall_shown_btn)
         bar.append(Gtk.Box(hexpand=True))
         self.todo_row = hbox(4)
         self.todo_row.set_margin_start(12)
@@ -233,15 +244,26 @@ class LibraryView(Gtk.Box):
         )
         self.add_controller(escape)
 
-        self._refresh_debounce = Debouncer(150, self.refresh)
+        self._stale = False
+        self._refresh_debounce = Debouncer(150, self.refresh, 3000, lambda: self.backend.downloads.busy)
         window.bridge.connect("packages:updated", lambda _p: self._refresh_debounce.trigger())
         window.bridge.connect("bookmarks:updated", lambda _p: self._refresh_debounce.trigger())
         window.bridge.connect("contents:updated", lambda _p: self.detail.refresh())
         window.bridge.connect("thumbnails:updated", self._on_thumbs_updated)
         self.status_list.set_options([(v, t, None) for v, t in STATUS_OPTIONS], None)
 
+    def on_shown(self) -> None:
+        if self._stale:
+            self.refresh()
+
+    def refresh_soon(self) -> None:
+        self._refresh_debounce.hurry()
+
     def refresh(self) -> None:
         if not self.backend.lib.is_configured:
+            return
+        self._stale = self.window.stack.get_visible_child() is not self
+        if self._stale:
             return
 
         def load():
@@ -269,8 +291,15 @@ class LibraryView(Gtk.Box):
         self.rows = ([local_row] if show_local else []) + packages + bookmarks
         self.global_counts = counts
         selected = self.selected_filename()
-        self.by_filename = rebuild_store(self.store, self.rows, lambda p: p["filename"])
-        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+        self.by_filename, changed = sync_store(self.store, self.rows, lambda p: p["filename"], self.by_filename)
+        for item in changed:
+            card = self._bound_cards.get(item.key)
+            if card is not None:
+                card.bind(item.data)
+        filter_inputs = (frozenset(self.updates), frozenset(self.texture_problems))
+        if filter_inputs != self._filter_inputs:
+            self._filter_inputs = filter_inputs
+            self.filter.changed(Gtk.FilterChange.DIFFERENT)
         self._refresh_filters()
         self._update_count()
         pending = self._pending_select
@@ -278,7 +307,7 @@ class LibraryView(Gtk.Box):
             self._pending_select = None
             self.select_filename(pending, scroll=True)
         elif selected and selected in self.by_filename:
-            if not self._reselect(selected):
+            if self.selected_filename() != selected and not self._reselect(selected):
                 self.detail_scroll.set_visible(True)
                 self.detail.show_package(selected)
         elif selected:
@@ -412,6 +441,7 @@ class LibraryView(Gtk.Box):
             self.count_label.set_text(f"{n} bookmark{'s' if n != 1 else ''}")
         else:
             self.count_label.set_text(f"{n} of {len(self.packages)} packages")
+        self.reinstall_shown_btn.set_visible(n > 0 and self.status != "bookmarked")
         self.empty.set_visible(n == 0 and len(self.rows) > 0)
         self.grid_scroll.set_visible(n > 0 or len(self.rows) == 0)
         q = self.search.get_text().strip()
@@ -769,6 +799,20 @@ class LibraryView(Gtk.Box):
 
     def install_all_missing(self):
         self.window.run_op(self.backend.downloads.enqueue_install_all_missing, then=self._report_install)
+
+    def reinstall_shown(self):
+        shown = [self.sorted.get_item(i) for i in range(self.sorted.get_n_items())]
+        roots = [it.key for it in shown if not is_bookmark_key(it.key)]
+        if not roots:
+            self.window.toast("No packages are shown.")
+            return
+        if len(roots) == 1:
+            d = next(it.data for it in shown if it.key == roots[0])
+            name = d.get("hub_display_name") or d.get("title") or d["package_name"]
+            heading = f"Reinstall {name} with its dependencies?"
+        else:
+            heading = f"Reinstall {len(roots)} packages with their dependencies?"
+        self.window.reinstall_with_deps(roots, heading=heading)
 
     def _installable_bookmarks(self) -> list[dict]:
         return [b for b in self.bookmarks if b.get("is_downloadable") and not b.get("installed_filename")]
@@ -1174,6 +1218,15 @@ class PackageDetail(Gtk.Box):
         self._button("Uninstall", self._uninstall, "destructive-action")
         if d.get("hub_resource_id") or d.get("is_hub_replaceable"):
             self._button("Reinstall", self._reinstall)
+        if d["deps"] and not (d.get("is_dummy") or d.get("is_alias")):
+            name = d.get("hub_display_name") or d.get("title") or d["package_name"]
+            self._button(
+                "Reinstall with dependencies…",
+                lambda: self.window.reinstall_with_deps([fn], heading=f"Reinstall {name} with its dependencies?"),
+                tooltip="Download this package and everything it depends on again, at the versions it names: "
+                "a version it asks for that you do not have is added next to the one you have, so VaM loads the "
+                "version this package was made with. Shows the plan before anything is downloaded.",
+            )
         self._button("Show in folder", self._open_folder)
         if d.get("hub_resource_id"):
             self._button("Open on Hub", lambda: open_url(hub_resource_page_url(d["hub_resource_id"])))
@@ -1251,6 +1304,15 @@ class PackageDetail(Gtk.Box):
         self._clear_actions()
         if d.get("missing_deps_total"):
             self._button(f"Install {d['missing_deps_total']} missing", self._install_missing, "suggested-action")
+        if d["deps"]:
+            self._button(
+                "Reinstall dependencies…",
+                lambda: self.window.reinstall_with_deps(
+                    [fn], heading="Reinstall what your loose scenes and presets use?"
+                ),
+                tooltip="Download every package your loose scenes and presets refer to again, at the versions "
+                "they name. Shows the plan before anything is downloaded.",
+            )
         self._button("Browse content", lambda: self.window.show_content_for_package(fn))
         self.description.set_text(
             "Packages referenced by these files count as dependencies: nothing they need is an orphan, "

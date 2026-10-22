@@ -7,11 +7,14 @@ import shutil
 import threading
 import time
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass, field
 
-from ..core.graph import is_flexible_ref, parse_dep_ref, resolve_ref
+from ..core.classifier import strip_disabled_suffix
+from ..core.graph import DepEdge, is_flexible_ref, parse_dep_ref, resolve_ref
+from ..core.paths import LOCAL_PACKAGE_DISPLAY_NAME, is_local_package
 from ..core.store import resolve_hub_download_url
-from ..core.varfile import IntegrityError, parse_var_filename, verify_package_full, verify_zip_file
+from ..core.varfile import IntegrityError, package_signature, parse_var_filename, verify_package_full, verify_zip_file
 from .client import HubClient, HubError, is_null_find_entry
 from .http import HttpTransport, TransportError, UrllibTransport
 
@@ -21,6 +24,7 @@ PROGRESS_INTERVAL = 0.25
 MAX_AUTO_RETRIES = 5
 RETRY_BASE_DELAY = 2.0
 PAUSED_SETTING = "downloads_paused"
+PLAN_LOOKUP_BATCH = 50
 
 
 class DownloadError(Exception):
@@ -40,11 +44,48 @@ def ensure_var_ext(filename) -> str | None:
 def is_flexible_filename(filename: str | None) -> bool:
     if not filename:
         return False
-    parts = re.sub(r"\.var$", "", filename, flags=re.IGNORECASE).split(".")
+    parts = var_stem(filename).split(".")
     if len(parts) < 3:
         return False
     last = parts[-1].lower()
     return last == "latest" or re.fullmatch(r"min\d+", last) is not None
+
+
+def _as_list(arg) -> list:
+    return [arg] if isinstance(arg, str) else list(arg or ())
+
+
+def var_stem(name: str) -> str:
+    return re.sub(r"\.var$", "", name, flags=re.IGNORECASE)
+
+
+def same_file_bytes(a: str, b: str, chunk: int = 1 << 20) -> bool:
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                block = fa.read(chunk)
+                if block != fb.read(chunk):
+                    return False
+                if not block:
+                    return True
+    except OSError:
+        return False
+
+
+def offered_file(entry) -> tuple[str | None, str | None]:
+    if not isinstance(entry, dict) or entry.get("filename") in (None, "", "null"):
+        return None, None
+    name = ensure_var_ext(entry["filename"])
+    if parse_var_filename(name) is None:
+        return None, None
+    return name, resolve_hub_download_url(entry)
+
+
+def exact_offer(entry, filename: str) -> tuple[str | None, str | None]:
+    name, url = offered_file(entry)
+    return (name, url) if name and name.lower() == filename.lower() else (None, None)
 
 
 def concrete_dep_filename(file: dict | None) -> str | None:
@@ -60,7 +101,7 @@ def concrete_dep_filename(file: dict | None) -> str | None:
 def is_dep_ref_present_locally(ref, package_index, group_index) -> bool:
     if not ref:
         return False
-    stem = re.sub(r"\.var$", "", str(ref), flags=re.IGNORECASE)
+    stem = var_stem(str(ref))
     if not stem:
         return False
     if resolve_ref(stem, package_index, group_index).resolved:
@@ -124,6 +165,11 @@ class DownloadManager:
         self._retry_timers: dict[int, threading.Timer] = {}
         self._pending_dep_lookups: set[str] = set()
         self._threads: dict[int, threading.Thread] = {}
+        self._quiet_running: set[int] = set()
+        self._quiet_done = 0
+        self._quiet_failed = 0
+        self._quiet_swapped = 0
+        self._quiet_same = 0
         self.paused = False
         self.on_integrated = None
 
@@ -131,10 +177,50 @@ class DownloadManager:
     def db(self):
         return self.lib.db
 
+    @property
+    def busy(self) -> bool:
+        return bool(self._active)
+
     def _emit_updated(self) -> None:
         self.lib.notify("downloads:updated")
 
+    def _settle_quiet(self, entry: dict, ok: bool) -> bool:
+        if not entry.get("quiet"):
+            return False
+        if not ok:
+            self._quiet_failed += 1
+            return True
+        self._quiet_done += 1
+        if entry.get("substituted_for"):
+            self._quiet_swapped += 1
+        if entry.get("unchanged"):
+            self._quiet_same += 1
+        return True
+
+    def _take_quiet_summary(self) -> str | None:
+        done, failed, swapped, same = self._quiet_done, self._quiet_failed, self._quiet_swapped, self._quiet_same
+        if self._quiet_running or not (done or failed) or self.db.has_pending_quiet_downloads():
+            return None
+        self._quiet_done = self._quiet_failed = self._quiet_swapped = self._quiet_same = 0
+        text = "Reinstall finished: " + (
+            f"{done} downloaded, {failed} failed" if failed else f"{done} package(s) downloaded"
+        )
+        if swapped:
+            text += f", {swapped} served as another version than the one asked for"
+        if same:
+            text += f", {same} identical to the copy you had"
+        return text + (". Local files were kept; Downloads lists why." if failed else "")
+
+    def _maybe_summarize(self) -> None:
+        with self._lock:
+            summary = self._take_quiet_summary()
+        if summary:
+            self.lib.notify("toast", {"message": summary})
+
     def _emit_failed(self, entry: dict, error: str | None) -> None:
+        with self._lock:
+            if self._settle_quiet(entry, ok=False):
+                return
         label = (entry.get("display_name") or "").strip() or entry.get("package_ref") or "Download"
         self.lib.notify(
             "toast", {"type": "error", "message": f"Download failed: {label}" + (f" — {error}" if error else "")}
@@ -177,6 +263,7 @@ class DownloadManager:
         display_name: str | None = None,
         auto_queue_deps: bool = True,
         reinstall: bool = False,
+        quiet: bool = False,
     ) -> bool:
         if os.path.basename(package_ref) != package_ref or parse_var_filename(package_ref) is None:
             log.warning("refusing to queue a file the Hub named %r", package_ref)
@@ -206,6 +293,7 @@ class DownloadManager:
                 "display_name": display_name,
                 "auto_queue_deps": 1 if auto_queue_deps else 0,
                 "reinstall": 1 if reinstall else 0,
+                "quiet": 1 if quiet else 0,
             }
         )
         return True
@@ -216,23 +304,8 @@ class DownloadManager:
             pkg = self.lib.store.package_index.get(fn) if fn else None
         if not pkg:
             raise DownloadError(f"{filename} is not in the library")
-        detail = None
-        file = None
         rid = pkg.get("hub_resource_id")
-        if rid:
-            try:
-                detail = self.hub.get_resource_detail(rid)
-                file = next(
-                    (
-                        f
-                        for f in detail.get("hubFiles") or []
-                        if (ensure_var_ext(f.get("filename")) or "").lower() == fn.lower()
-                        and resolve_hub_download_url(f)
-                    ),
-                    None,
-                )
-            except HubError as err:
-                log.info("reinstall %s: resource %s unavailable (%s), looking the file up by name", fn, rid, err)
+        file, detail = self._resource_file(rid, fn) if rid else (None, None)
         if file is None:
             file = self._find_exact_file(fn)
         if file is None:
@@ -266,12 +339,296 @@ class DownloadManager:
                 unavailable.append(fn)
         return {"queued": queued, "unavailable": unavailable}
 
+    def _resource_file(self, rid, filename: str) -> tuple[dict | None, dict | None]:
+        try:
+            detail = self.hub.get_resource_detail(rid)
+        except HubError as err:
+            log.info("reinstall %s: resource %s unavailable (%s)", filename, rid, err)
+            return None, None
+        file = next(
+            (
+                f
+                for f in detail.get("hubFiles") or []
+                if (ensure_var_ext(f.get("filename")) or "").lower() == filename.lower() and resolve_hub_download_url(f)
+            ),
+            None,
+        )
+        return file, detail
+
+    def plan_reinstall(self, filenames=(), local_paths=(), on_progress=None, cancel=None) -> dict:
+        roots = [f if is_local_package(f) else ensure_var_ext(f) for f in _as_list(filenames)]
+        paths = [strip_disabled_suffix(p) for p in _as_list(local_paths)]
+        info: dict[str, dict] = {}
+        deps_of: dict[str, list[DepEdge]] = {}
+        with self.lib.lock:
+            store = self.lib.store
+
+            def visit(fn: str) -> bool:
+                pkg = store.package_index.get(fn)
+                if fn in info or not pkg or is_local_package(fn):
+                    return False
+                info[fn] = {
+                    "placeholder": store.is_placeholder(fn),
+                    "unpacked": bool(pkg.get("is_unpacked")),
+                    "rid": pkg.get("hub_resource_id"),
+                    "direct": bool(pkg.get("is_direct")),
+                    "title": pkg.get("hub_display_name") or pkg.get("title") or fn,
+                }
+                if not info[fn]["placeholder"]:
+                    deps_of[fn] = list(store.forward_deps.get(fn, ()))
+                return True
+
+            for fn in roots:
+                if is_local_package(fn) and fn in store.package_index:
+                    deps_of[fn] = list(store.forward_deps.get(fn, ()))
+                else:
+                    visit(fn)
+            for p in paths:
+                deps_of[p] = [
+                    DepEdge(r, *resolve_ref(r, store.package_index, store.group_index))
+                    for r in store.local_file_refs.get(p, ())
+                ]
+            queue = deque(deps_of)
+            while queue:
+                for d in deps_of[queue.popleft()]:
+                    if d.resolved and visit(d.resolved) and d.resolved in deps_of:
+                        queue.append(d.resolved)
+        if not info and not deps_of:
+            raise DownloadError(f"{', '.join(roots + paths) or 'Nothing'} is not in the library")
+
+        root_set = {fn for fn in roots if fn in info}
+        lone = next(iter(root_set)) if len(roots) == 1 and root_set and not paths else None
+
+        def stopped() -> bool:
+            return cancel is not None and cancel.is_set()
+
+        def real(fn) -> bool:
+            return fn in info and not info[fn]["placeholder"]
+
+        def satisfied(d: DepEdge) -> bool:
+            return real(d.resolved) and d.resolution in ("exact", "latest")
+
+        def downloadable_again(fn: str) -> bool:
+            i = info[fn]
+            return fn in root_set if i["placeholder"] else (not i["unpacked"] or fn == lone)
+
+        keys: dict[str, None] = {var_stem(fn): None for fn in info if downloadable_again(fn)}
+        for deps in deps_of.values():
+            for d in deps:
+                p = None if satisfied(d) else parse_dep_ref(d.ref)
+                if p is not None:
+                    keys[d.ref] = None
+                    if p.version == "min":
+                        keys[f"{p.package_name}.{p.min_version}"] = None
+        names = list(keys)
+        batches = [names[i : i + PLAN_LOOKUP_BATCH] for i in range(0, len(names), PLAN_LOOKUP_BATCH)]
+        found: dict[str, dict] = {}
+        failed: set[str] = set()
+        last_err = None
+        for i, batch in enumerate(batches):
+            if stopped():
+                return {"cancelled": True}
+            if on_progress:
+                on_progress({"status": "lookup", "step": i, "total": len(batches)})
+            try:
+                found.update(self.hub.find_packages(batch))
+            except HubError as err:
+                log.warning("reinstall plan: the Hub did not answer for %d name(s): %s", len(batch), err)
+                failed.update(batch)
+                last_err = err
+        if last_err is not None and len(failed) == len(names):
+            raise last_err
+        if on_progress:
+            on_progress({"status": "lookup", "step": len(batches), "total": len(batches)})
+        sources: dict[str, dict] = {}
+
+        def same_package(name: str, p) -> bool:
+            return parse_var_filename(name).package_name.lower() == p.package_name.lower()
+
+        def choose_file(fn: str) -> dict:
+            i = info[fn]
+            row = {
+                "filename": fn,
+                "title": i["title"],
+                "is_root": fn in root_set,
+                "is_placeholder": i["placeholder"],
+                "needed_by": [],
+                "action": "keep",
+                "reason": None,
+                "size": None,
+            }
+            if i["unpacked"] and fn != lone:
+                row["reason"] = "unpacked"
+                return row
+            entry = found.get(var_stem(fn))
+            name, url = exact_offer(entry, fn)
+            listed = name is not None
+            if not (listed and url) and i["rid"] and (listed or fn == lone) and not stopped():
+                file, _detail = self._resource_file(i["rid"], fn)
+                if file is not None:
+                    entry, url, listed = file, resolve_hub_download_url(file), True
+            if listed and url:
+                sources[fn] = {
+                    "url": url,
+                    "resource_id": entry.get("resource_id") or i["rid"],
+                    "size": _file_size(entry),
+                }
+                row.update(action="reinstall", size=sources[fn]["size"])
+            elif listed:
+                row["reason"] = "no_download"
+            else:
+                row["reason"] = "lookup_failed" if var_stem(fn) in failed else "not_on_hub"
+            return row
+
+        def choose_ref(d: DepEdge) -> dict:
+            row = {
+                "ref": d.ref,
+                "needed_by": [],
+                "action": "unavailable",
+                "kind": None,
+                "filename": None,
+                "reason": None,
+                "size": None,
+                "offers": None,
+                "stand_in": d.resolved,
+                "stand_in_kind": ("fallback" if real(d.resolved) else "placeholder") if d.resolved else None,
+            }
+            p = parse_dep_ref(d.ref)
+            if p is None:
+                row["reason"] = "invalid"
+                return row
+            exact = f"{p.package_name}.{p.min_version}" if p.version == "min" else None
+            if not is_flexible_ref(p):
+                exact = d.ref
+            fits = []
+            if exact:
+                name, url = exact_offer(found.get(exact), exact + ".var")
+                if name:
+                    fits.append((name, url, found[exact]))
+            other, other_url = offered_file(found.get(d.ref))
+            if other and not same_package(other, p):
+                other = None
+            if other and is_flexible_ref(p) and int(parse_var_filename(other).version) >= (p.min_version or 0):
+                fits.append((other, other_url, found[d.ref]))
+            pick = next((("requested", *fit) for fit in fits if fit[1]), None)
+            if other and not any(other.lower() == fit[0].lower() for fit in fits):
+                row["offers"] = other
+                if pick is None and other_url and not d.resolved:
+                    pick = ("substitute", other, other_url, found[d.ref])
+            if pick is not None:
+                kind, name, url, entry = pick
+                sources[name] = {"url": url, "resource_id": entry.get("resource_id"), "size": _file_size(entry)}
+                row.update(action="install", kind=kind, filename=name, size=sources[name]["size"], offers=None)
+            elif d.ref in failed or exact in failed:
+                row["reason"] = "lookup_failed"
+            else:
+                row["reason"] = "no_download" if fits else "not_on_hub"
+            return row
+
+        files: dict[str, dict] = {}
+        refs: dict[str, dict] = {}
+
+        def note(rows: dict, key: str, make, parent: str | None) -> dict:
+            row = rows.get(key)
+            if row is None:
+                row = rows[key] = make()
+            if parent is not None and parent not in row["needed_by"]:
+                row["needed_by"].append(parent)
+            return row
+
+        for fn in roots:
+            if fn in info:
+                note(files, fn, lambda fn=fn: choose_file(fn), None)
+        starts = [fn for fn in roots if fn in deps_of] + paths
+        queue = deque(starts)
+        walked = set(starts)
+        while queue:
+            node = queue.popleft()
+            for d in deps_of.get(node, ()):
+                follow = None
+                if satisfied(d):
+                    note(files, d.resolved, lambda d=d: choose_file(d.resolved), node)
+                    follow = d.resolved
+                else:
+                    row = note(refs, d.ref, lambda d=d: choose_ref(d), node)
+                    if row["action"] == "unavailable" and row["stand_in_kind"] == "fallback":
+                        note(files, d.resolved, lambda d=d: choose_file(d.resolved), node)
+                        follow = d.resolved
+                if follow in deps_of and follow not in walked:
+                    walked.add(follow)
+                    queue.append(follow)
+        if stopped():
+            return {"cancelled": True}
+
+        def parent_of(row: dict) -> str | None:
+            first = row["needed_by"][0] if row["needed_by"] else None
+            return LOCAL_PACKAGE_DISPLAY_NAME if is_local_package(first) else first
+
+        downloads: dict[str, dict] = {}
+        for row in sorted(refs.values(), key=lambda r: r["kind"] != "requested"):
+            if row["action"] == "install" and row["filename"].lower() not in downloads:
+                src = sources[row["filename"]]
+                downloads[row["filename"].lower()] = {
+                    "filename": row["filename"],
+                    "url": src["url"],
+                    "resource_id": src["resource_id"],
+                    "file_size": src["size"],
+                    "reinstall": False,
+                    "priority": "dependency",
+                    "parent_ref": parent_of(row),
+                    "display_name": None,
+                }
+        for row in files.values():
+            fn = row["filename"]
+            if row["action"] == "reinstall" and fn.lower() not in downloads:
+                src = sources[fn]
+                fetch = row["is_placeholder"]
+                downloads[fn.lower()] = {
+                    "filename": fn,
+                    "url": src["url"],
+                    "resource_id": src["resource_id"],
+                    "file_size": src["size"],
+                    "reinstall": not fetch,
+                    "priority": "direct" if fn == lone and info[fn]["direct"] else "dependency",
+                    "parent_ref": None if row["is_root"] else parent_of(row),
+                    "display_name": None if fetch else f"{row['title']} (reinstall)",
+                }
+        return {
+            "cancelled": False,
+            "files": list(files.values()),
+            "refs": list(refs.values()),
+            "downloads": list(downloads.values()),
+            "lookup_failed": len(failed),
+            "total_size": sum(s["file_size"] or 0 for s in downloads.values()),
+        }
+
+    def enqueue_reinstall_plan(self, plan: dict, only_missing: bool = False) -> dict:
+        queued, skipped = [], []
+        specs = [s for s in plan.get("downloads") or () if not (only_missing and s["reinstall"])]
+        with self.lib.lock, self.db.transaction():
+            for s in specs:
+                inserted = self._insert(
+                    s["filename"],
+                    url=s["url"],
+                    resource_id=s["resource_id"],
+                    file_size=s["file_size"],
+                    priority=s["priority"],
+                    parent_ref=s["parent_ref"],
+                    display_name=s["display_name"],
+                    auto_queue_deps=not s["reinstall"],
+                    reinstall=s["reinstall"],
+                    quiet=True,
+                )
+                (queued if inserted else skipped).append(s["filename"])
+        if queued:
+            self._emit_updated()
+            self.process_queue()
+        return {"queued": queued, "skipped": skipped, "paused": self.paused}
+
     def _find_exact_file(self, filename: str) -> dict | None:
-        stem = re.sub(r"\.var$", "", filename, flags=re.IGNORECASE)
+        stem = var_stem(filename)
         file = self.hub.find_packages([stem]).get(stem)
-        if is_null_find_entry(file) or (ensure_var_ext(file.get("filename")) or "").lower() != filename.lower():
-            return None
-        return file if resolve_hub_download_url(file) else None
+        return file if exact_offer(file, filename)[1] else None
 
     def enqueue_install(
         self,
@@ -392,7 +749,7 @@ class DownloadManager:
                             auto_queue_deps=auto_queue_deps,
                         )
                     continue
-                ref = re.sub(r"\.var$", "", f.get("filename") or "", flags=re.IGNORECASE)
+                ref = var_stem(f.get("filename") or "")
                 if (ref and is_dep_ref_present_locally(ref, package_index, group_index)) or is_dep_ref_present_locally(
                     f.get("packageName") or group, package_index, group_index
                 ):
@@ -435,7 +792,7 @@ class DownloadManager:
         return unresolved
 
     def _queue_refs(
-        self, refs: list[str], parent_ref: str | None, auto_queue_deps: bool
+        self, refs: list[str], parent_ref: str | None, auto_queue_deps: bool, quiet: bool = False
     ) -> tuple[int, list[str], list[str]]:
         if not refs:
             return 0, [], []
@@ -468,6 +825,7 @@ class DownloadManager:
                     file_size=_file_size(f),
                     parent_ref=parent_ref,
                     auto_queue_deps=auto_queue_deps,
+                    quiet=quiet,
                 ):
                     queued += 1
         if queued:
@@ -514,7 +872,7 @@ class DownloadManager:
         rid = hub_file.get("resource_id")
         found = bool(url)
         if not url:
-            stem = re.sub(r"\.var$", "", fn, flags=re.IGNORECASE)
+            stem = var_stem(fn)
             f = self.hub.find_packages([stem]).get(stem)
             found = bool(f) and f.get("filename") not in (None, "null")
             if found:
@@ -571,6 +929,7 @@ class DownloadManager:
             except OSError:
                 pass
         self._emit_updated()
+        self._maybe_summarize()
 
     def retry(self, dl_id: int) -> None:
         with self._lock:
@@ -620,6 +979,7 @@ class DownloadManager:
             self._retry_timers.clear()
             self._retry_counts.clear()
             self._paused_progress.clear()
+            self._quiet_done = self._quiet_failed = self._quiet_swapped = self._quiet_same = 0
         self.db.cancel_all_downloads()
         self.paused = False
         self.db.set_setting(PAUSED_SETTING, None)
@@ -656,6 +1016,7 @@ class DownloadManager:
                 if not nxt:
                     break
                 self._start(nxt)
+        self._maybe_summarize()
 
     def _pick_next(self) -> dict | None:
         queued = [
@@ -669,6 +1030,8 @@ class DownloadManager:
     def _start(self, entry: dict) -> None:
         transfer = Transfer(entry["id"])
         self._active[entry["id"]] = transfer
+        if entry.get("quiet"):
+            self._quiet_running.add(entry["id"])
         self._paused_progress.pop(entry["id"], None)
         self.db.update_download_status(entry["id"], "active")
         th = threading.Thread(target=self._run, args=(entry, transfer), name=f"download-{entry['id']}", daemon=True)
@@ -711,6 +1074,8 @@ class DownloadManager:
         finally:
             with self._lock:
                 self._threads.pop(entry["id"], None)
+                self._quiet_running.discard(entry["id"])
+            self._maybe_summarize()
 
     def _run_inner(self, entry: dict, transfer: Transfer) -> None:
         dl_id = entry["id"]
@@ -829,12 +1194,37 @@ class DownloadManager:
                     self.db.update_download_status(dl_id, "completed", temp_path=None)
                     self._emit_progress(transfer, file_size, final=True)
                     log.info("%s: the real package replaced the %s", package_ref, res_replace.get("replaced"))
-                    self.lib.notify(
-                        "toast",
-                        {"message": f"{package_ref}: the real package replaced the {res_replace.get('replaced')}"},
-                    )
+                    if not entry.get("quiet"):
+                        self.lib.notify(
+                            "toast",
+                            {"message": f"{package_ref}: the real package replaced the {res_replace.get('replaced')}"},
+                        )
                     self._after_integration(entry, {"filename": package_ref, "landed": res_replace.get("landed")})
                 self._emit_updated()
+                self.process_queue()
+                return
+            kept = self._local_copy_matches(entry, temp_path, final_path)
+            if kept:
+                entry["unchanged"] = True
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                self._finish(dl_id)
+                with self._lock:
+                    self._retry_counts.pop(dl_id, None)
+                self.db.update_download_status(dl_id, "completed", temp_path=None)
+                self._emit_progress(transfer, file_size, final=True)
+                rid = entry.get("hub_resource_id")
+                self.lib.apply_hub_detail(package_ref, self.hub.get_cached_detail(rid) if rid else None)
+                log.info("%s: the download is identical to the local file, which is left as it is", package_ref)
+                if not entry.get("quiet"):
+                    self.lib.notify(
+                        "toast", {"message": f"{package_ref} already matched the Hub's file, so it was left as it is"}
+                    )
+                self._after_integration(entry, {"filename": package_ref, "landed": kept["storage_state"]})
+                self._emit_updated()
+                self.process_queue()
                 return
             if entry.get("reinstall"):
                 if os.path.isdir(final_path):
@@ -926,11 +1316,26 @@ class DownloadManager:
         log.warning("Hub served %s for %s; keeping it under its real name", served, ref)
         entry["package_ref"] = served
         entry["substituted_for"] = ref
-        self.lib.notify(
-            "toast", {"message": f"The Hub served {served} instead of {ref}; installing it under its real name"}
-        )
+        if not entry.get("quiet"):
+            self.lib.notify(
+                "toast", {"message": f"The Hub served {served} instead of {ref}; installing it under its real name"}
+            )
         self._emit_updated()
         return served
+
+    def _local_copy_matches(self, entry: dict, temp_path: str, final_path: str) -> dict | None:
+        if not entry.get("reinstall"):
+            return None
+        with self.lib.lock:
+            pkg = self.lib.store.package_index.get(entry["package_ref"])
+        if not pkg or pkg.get("is_corrupted") or not os.path.isfile(final_path):
+            return None
+        try:
+            if package_signature(final_path) != (pkg["size_bytes"], pkg["file_mtime"]):
+                return None
+        except OSError:
+            return None
+        return pkg if same_file_bytes(temp_path, final_path) else None
 
     def _integrate(self, entry: dict, final_path: str) -> None:
         rid = entry.get("hub_resource_id")
@@ -955,6 +1360,8 @@ class DownloadManager:
         self._after_integration(entry, res)
 
     def _after_integration(self, entry: dict, res: dict | None) -> None:
+        with self._lock:
+            self._settle_quiet(entry, ok=True)
         if not res:
             return
         if entry.get("auto_queue_deps") and res.get("landed") != "archived":
@@ -978,7 +1385,7 @@ class DownloadManager:
             queued_bases = set()
             for d in self.db.get_all_downloads():
                 if d["status"] in ("queued", "active"):
-                    p = parse_dep_ref(re.sub(r"\.var$", "", d["package_ref"], flags=re.IGNORECASE))
+                    p = parse_dep_ref(var_stem(d["package_ref"]))
                     if p:
                         queued_bases.add(p.package_name)
             truly = []
@@ -1000,7 +1407,7 @@ class DownloadManager:
             return
         root_parent = entry.get("parent_ref") or filename
         try:
-            self._queue_refs(list(dict.fromkeys(truly)), root_parent, True)
+            self._queue_refs(list(dict.fromkeys(truly)), root_parent, True, bool(entry.get("quiet")))
         except Exception:
             log.exception("transitive dep discovery failed")
         finally:

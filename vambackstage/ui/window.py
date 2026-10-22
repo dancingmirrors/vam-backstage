@@ -118,13 +118,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.app.set_accels_for_action("win.settings", ["<primary>comma"])
         self.app.set_accels_for_action("win.rescan", ["F5"])
 
-        self._stats_debounce = Debouncer(200, self.refresh_stats)
+        self._stats_debounce = Debouncer(200, self.refresh_stats, 3000, lambda: self.backend.downloads.busy)
         self.bridge.connect("packages:updated", lambda _p: self._stats_debounce.trigger())
         self.bridge.connect("contents:updated", lambda _p: self._stats_debounce.trigger())
         self.bridge.connect("scan:progress", self._on_scan_progress)
         self.bridge.connect("toast", self._on_toast)
         self.bridge.connect("bookmarks:resolved", self._on_bookmarks_resolved)
-        self.bridge.connect("downloads:updated", lambda _p: self._update_downloads_badge())
+        self._badge_debounce = Debouncer(150, self._update_downloads_badge, 1000, lambda: self.backend.downloads.busy)
+        self.bridge.connect("downloads:updated", lambda _p: self._badge_debounce.trigger())
         self.stack.connect("notify::visible-child", lambda *_: self._on_view_changed())
         self._first_run = None
         self._settings_dialog = None
@@ -192,6 +193,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         def done(result):
             self._end_busy()
+            self._hurry_refreshes()
             if success:
                 self.toast(success)
             if then:
@@ -199,9 +201,15 @@ class MainWindow(Adw.ApplicationWindow):
 
         def failed(err):
             self._end_busy()
+            self._hurry_refreshes()
             self.toast(f"Failed: {err}", 8)
 
         run_async(fn, *args, on_done=done, on_error=failed)
+
+    def _hurry_refreshes(self) -> None:
+        self.library.refresh_soon()
+        self.content.refresh_soon()
+        self._stats_debounce.hurry()
 
     def _begin_busy(self) -> None:
         self._busy = getattr(self, "_busy", 0) + 1
@@ -438,6 +446,44 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.connect("response", on_response)
         dialog.present(self)
+
+    def reinstall_with_deps(self, filenames=(), local_paths=(), heading: str = "Reinstall with dependencies?") -> None:
+        if self._integrity_cancel is not None:
+            self.toast("A check is already running")
+            return
+        if not self.backend.lib.is_configured:
+            return
+        self._integrity_cancel = threading.Event()
+        self._begin_busy()
+        self.status_stop.set_visible(True)
+        self.show_progress("Asking the Hub for the versions packages name…", 0.0)
+        run_async(
+            self.backend.downloads.plan_reinstall,
+            list(filenames),
+            list(local_paths),
+            lambda p: on_main(self._reinstall_progress, p),
+            self._integrity_cancel,
+            on_done=lambda plan: self._reinstall_planned(plan, heading),
+            on_error=self._reinstall_failed,
+        )
+
+    def _reinstall_progress(self, p: dict) -> None:
+        total = p.get("total") or 0
+        if total:
+            self.show_progress(f"Asking the Hub {p['step']}/{total}…", p["step"] / total)
+
+    def _reinstall_failed(self, err) -> None:
+        self._integrity_finish()
+        self.toast(f"Could not plan the reinstall: {err}", 8)
+
+    def _reinstall_planned(self, plan: dict, heading: str) -> None:
+        from .reinstall import present_plan
+
+        self._integrity_finish()
+        if plan.get("cancelled"):
+            self.toast("Stopped; nothing was queued")
+            return
+        present_plan(self, plan, heading)
 
     def check_textures(self, filenames: list[str] | None = None, include_deps: bool = False) -> None:
         if self._integrity_cancel is not None:

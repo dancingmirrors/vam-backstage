@@ -325,6 +325,23 @@ def test_downloads_reinstall_column_migrates_from_v1(tmp_path):
     db.close()
 
 
+def test_downloads_quiet_column_migrates_from_v7(tmp_path):
+    from vambackstage.core.db import SCHEMA_VERSION, Database
+
+    path = tmp_path / "old.db"
+    db = Database(path)
+    db._conn.execute("ALTER TABLE downloads DROP COLUMN quiet")
+    db._conn.execute("PRAGMA user_version = 7")
+    db.close()
+    db = Database(path)
+    assert db._schema_version() == SCHEMA_VERSION
+    db.insert_download({"package_ref": "A.B.1.var", "download_url": "https://x", "quiet": 1})
+    assert db.get_download_by_ref("A.B.1.var")["quiet"] == 1 and db.has_pending_quiet_downloads()
+    db.insert_download({"package_ref": "C.D.1.var", "download_url": "https://y"})
+    assert db.get_download_by_ref("C.D.1.var")["quiet"] == 0
+    db.close()
+
+
 def test_packages_is_dummy_column_migrates_from_v2(tmp_path):
     from vambackstage.core.db import SCHEMA_VERSION, Database
 
