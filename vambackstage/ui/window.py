@@ -643,10 +643,12 @@ class MainWindow(Adw.ApplicationWindow):
             application_icon=APP_ID,
             version=__version__,
             developer_name="dancingmirrors",
+            copyright="© 2026 cyberpunk2073\n© 2026 dancingmirrors",
             license_type=Gtk.License.MIT_X11,
             website="https://github.com/dancingmirrors/vam-backstage",
             comments="Manage your Virt-a-Mate library: dependencies, content visibility and Hub installs.",
         )
+        about.add_credit_section("Original app by", ["cyberpunk2073 https://github.com/cyberpunk2073/vam-backstage"])
         about.connect("closed", lambda *_: setattr(self, "_about_dialog", None))
         self._about_dialog = about
         about.present(self)
